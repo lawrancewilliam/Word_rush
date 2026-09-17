@@ -17,6 +17,7 @@
   let currentGame = $state(null);
   let players = $state([]);
   let playerCount = $state(0);
+  let playersLoadSeq = $state(0);
 
   let questionNumber = $state(0);
   let totalQuestions = $state(20);
@@ -63,6 +64,19 @@
     }
   }
 
+  async function refreshGameState() {
+    if (!currentGame?.id) return null;
+    const { data: game } = await supabase
+      .from('games')
+      .select('*')
+      .eq('id', currentGame.id)
+      .single();
+    if (game) {
+      currentGame = { ...currentGame, ...game };
+    }
+    return game;
+  }
+
   async function checkSession() {
     loading = true;
     error = '';
@@ -80,6 +94,7 @@
         return;
       }
 
+      console.log('[WORD RUSH Student] gameNumber:', gameNumber, 'gameId:', gameInfo.id, 'status:', gameInfo.status);
       currentGame = gameInfo;
 
       const { data: existing, error: fetchError } = await supabase
@@ -97,17 +112,23 @@
       if (existing) {
         playerId = existing.id;
         playerName = existing.name;
+        console.log('[WORD RUSH Student] restored player:', existing.name, 'in game', gameNumber);
+
+        await subscribeToGame(gameInfo.id);
 
         if (gameInfo.status === 'LOBBY_OPEN') {
           screen = 'LOBBY';
-          await subscribeToGame(gameInfo.id);
+          await loadPlayers(gameInfo.id);
+        } else if (gameInfo.status === 'LOBBY_CLOSED') {
+          screen = 'LOBBY';
           await loadPlayers(gameInfo.id);
         } else if (gameInfo.status === 'COUNTDOWN') {
-          screen = 'COUNTDOWN';
-          await subscribeToGame(gameInfo.id);
+          await handleCountdownState();
         } else if (gameInfo.status === 'PLAYING' || gameInfo.status === 'QUESTION_LOCKED') {
           screen = 'PLAYING';
-          await subscribeToGame(gameInfo.id);
+          await loadCurrentQuestion();
+        } else if (gameInfo.status === 'PAUSED') {
+          screen = 'PLAYING';
           await loadCurrentQuestion();
         } else if (gameInfo.status === 'COMPLETED') {
           screen = 'GAME_COMPLETED';
@@ -136,7 +157,7 @@
         }
       }
     } catch (e) {
-      console.error('[WORD RUSH] Session check failed:', e?.message || e);
+      console.error('[WORD RUSH Student] Session check failed:', e?.message || e);
       error = 'Failed to load game. Please refresh.';
       screen = 'ERROR';
     } finally {
@@ -145,13 +166,14 @@
   }
 
   async function loadPlayers(gameId) {
+    const seq = ++playersLoadSeq;
     const { data, error: fetchError } = await supabase
       .from('players')
       .select('id, name')
       .eq('game_id', gameId)
       .eq('is_active', true);
 
-    if (!fetchError) {
+    if (!fetchError && seq === playersLoadSeq) {
       players = data || [];
       playerCount = players.length;
     }
@@ -166,6 +188,8 @@
       .single();
 
     if (fetchError || !game) return;
+
+    console.log('[WORD RUSH Student] loadCurrentQuestion:', game.current_question_number, 'status:', game.status);
 
     questionNumber = game.current_question_number;
     totalQuestions = game.total_questions;
@@ -183,6 +207,7 @@
         hint = '';
         wrongAnswer = false;
         showWrongMessage = false;
+        console.log('[WORD RUSH Student] question loaded:', q.jumbled_word);
       }
     }
 
@@ -220,6 +245,20 @@
     const m = Math.floor(seconds / 60);
     const s = seconds % 60;
     return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+  }
+
+  async function handleCountdownState() {
+    const game = await refreshGameState();
+    if (game && game.status === 'PLAYING') {
+      screen = 'PLAYING';
+      await loadCurrentQuestion();
+    } else if (game && game.status === 'COUNTDOWN') {
+      screen = 'COUNTDOWN';
+      startCountdown();
+    } else if (game) {
+      screen = 'PLAYING';
+      await loadCurrentQuestion();
+    }
   }
 
   async function joinGame() {
@@ -319,9 +358,10 @@
 
   function subscribeToGame(gameId) {
     cleanupSubscriptions();
+    console.log('[WORD RUSH Student] subscribing to game:', gameId);
 
     const gameChannel = supabase
-      .channel(`game-${gameId}`)
+      .channel(`student-game-${gameId}`)
       .on('postgres_changes', {
         event: 'UPDATE',
         schema: 'public',
@@ -329,23 +369,30 @@
         filter: `id=eq.${gameId}`
       }, async (payload) => {
         const g = payload.new;
+        console.log('[WORD RUSH Student] game UPDATE:', g.status);
         currentGame = { ...currentGame, ...g };
 
         if (g.status === 'LOBBY_OPEN') {
           screen = 'LOBBY';
           await loadPlayers(gameId);
+        } else if (g.status === 'LOBBY_CLOSED') {
+          screen = 'LOBBY';
+          await loadPlayers(gameId);
         } else if (g.status === 'COUNTDOWN') {
-          screen = 'COUNTDOWN';
-          startCountdown();
+          await handleCountdownState();
         } else if (g.status === 'PLAYING') {
-          if (screen === 'COUNTDOWN') {
-            screen = 'PLAYING';
-          }
+          screen = 'PLAYING';
           await loadCurrentQuestion();
         } else if (g.status === 'QUESTION_LOCKED') {
+          if (screen !== 'PLAYING' && screen !== 'QUESTION_RESULT') {
+            screen = 'PLAYING';
+            await loadCurrentQuestion();
+          }
+        } else if (g.status === 'PAUSED') {
+          if (timerInterval) clearInterval(timerInterval);
         } else if (g.status === 'COMPLETED') {
           screen = 'GAME_COMPLETED';
-          clearInterval(timerInterval);
+          if (timerInterval) clearInterval(timerInterval);
         }
       })
       .subscribe();
@@ -353,7 +400,7 @@
     subscriptions.push(gameChannel);
 
     const playerChannel = supabase
-      .channel(`players-${gameId}`)
+      .channel(`student-players-${gameId}`)
       .on('postgres_changes', {
         event: '*',
         schema: 'public',
@@ -367,7 +414,7 @@
     subscriptions.push(playerChannel);
 
     const resultChannel = supabase
-      .channel(`results-${gameId}`)
+      .channel(`student-results-${gameId}`)
       .on('postgres_changes', {
         event: 'UPDATE',
         schema: 'public',
@@ -423,9 +470,18 @@
         i++;
         setTimeout(nextStep, steps[i - 1].delay);
       } else {
-        screen = 'PLAYING';
         countdownNumber = null;
-        loadCurrentQuestion();
+        refreshGameState().then(async (game) => {
+          if (game && game.status === 'PLAYING') {
+            screen = 'PLAYING';
+            await loadCurrentQuestion();
+          } else if (game && (game.status === 'COUNTDOWN' || game.status === 'LOBBY_CLOSED')) {
+            await handleCountdownState();
+          } else if (game) {
+            screen = 'PLAYING';
+            await loadCurrentQuestion();
+          }
+        });
       }
     }
     nextStep();
