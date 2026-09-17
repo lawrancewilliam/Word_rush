@@ -167,6 +167,19 @@
   }
 
   function updateDisplayState(game) {
+    if (game.status === 'COMPLETED') {
+      if (game.tie_breaker_status === 'LOBBY_OPEN') {
+        displayState = 'TIE_BREAKER_WAITING';
+      } else if (game.tie_breaker_status === 'ACTIVE') {
+        displayState = 'TIE_BREAKER_QUESTION';
+        loadTieBreakerQuestionData(game);
+      } else if (game.tie_breaker_status === 'COMPLETED' || game.tie_breaker_status === 'UNRESOLVED' || game.tie_breaker_status === 'NONE') {
+        displayState = 'FINAL_RESULT';
+        loadChampions();
+      }
+      return;
+    }
+
     switch (game.status) {
       case 'LOBBY_OPEN':
         displayState = 'LOBBY';
@@ -193,6 +206,26 @@
         loadChampions();
         break;
     }
+  }
+
+  async function loadTieBreakerQuestionData(game) {
+    if (!game.tie_breaker_question_id) return;
+
+    questionNumber = game.tie_breaker_question_number || 0;
+    totalQuestions = 5;
+    questionDeadline = game.tie_breaker_deadline;
+
+    const { data: q } = await supabase
+      .from('questions')
+      .select('jumbled_word')
+      .eq('id', game.tie_breaker_question_id)
+      .single();
+
+    if (q) {
+      jumbledWord = q.jumbled_word;
+    }
+
+    startTimer();
   }
 
   function setupSubscriptions() {
@@ -556,6 +589,55 @@
       <p class="text-base text-gray-400 tracking-wider animate-pulse mt-6">
         Waiting for host...
       </p>
+    </div>
+
+  {:else if displayState === 'TIE_BREAKER_WAITING'}
+    <div class="text-center space-y-8 animate-fade-in max-w-3xl">
+      <div>
+        <h1 class="text-5xl md:text-7xl font-black tracking-tight text-amber-600">
+          TIE BREAKER
+        </h1>
+        <p class="text-xl md:text-2xl text-gray-400 mt-4 tracking-[0.2em] uppercase">
+          GET READY...
+        </p>
+      </div>
+      <div class="flex items-center justify-center gap-3">
+        <div class="w-2 h-2 rounded-full bg-amber-500 animate-pulse"></div>
+        <p class="text-xl md:text-2xl text-gray-400 tracking-wider">
+          Waiting for host to start...
+        </p>
+      </div>
+    </div>
+
+  {:else if displayState === 'TIE_BREAKER_QUESTION'}
+    <div class="w-full max-w-5xl text-center space-y-8 animate-fade-in">
+      <div class="space-y-2">
+        <h1 class="text-4xl md:text-5xl font-black tracking-tight text-amber-600">
+          TIE BREAKER
+        </h1>
+      </div>
+
+      <div class="text-lg md:text-xl text-amber-500 tracking-[0.3em] uppercase">
+        QUESTION {questionNumber} / {totalQuestions}
+      </div>
+
+      <div class="py-8">
+        <div class="inline-block px-12 py-6 rounded-3xl bg-amber-50 border border-amber-200 shadow-lg">
+          <p class="text-xs md:text-sm text-amber-600 uppercase tracking-[0.4em] mb-4">Unscramble this word</p>
+          <div class="text-5xl md:text-7xl font-bold tracking-[0.3em] text-gray-900 select-none leading-tight">
+            {jumbledWord}
+          </div>
+        </div>
+      </div>
+
+      <div class="flex items-center justify-center gap-12">
+        <div class="text-center">
+          <div class="text-4xl md:text-6xl font-mono font-bold {timeRemaining <= 10 ? 'text-red-500' : 'text-gray-900'} {timeRemaining <= 5 ? 'animate-pulse' : ''}">
+            {formatTime(timeRemaining)}
+          </div>
+          <p class="text-xs md:text-sm text-gray-400 mt-2 tracking-[0.2em] uppercase">TIME LEFT</p>
+        </div>
+      </div>
     </div>
 
   {:else if displayState === 'FINAL_RESULT'}

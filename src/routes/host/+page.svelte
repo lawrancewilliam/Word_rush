@@ -45,9 +45,33 @@
   let showQuestionBank = $state(false);
   let questionsLoaded = $state(false);
 
+  let tieBreakerParticipants = $state([]);
+  let tieBreakerTimer = $state(0);
+  let tieBreakerCountdown = $state(null);
+  let tieBreakerCountdownInterval = $state(null);
+  let tieBreakerTimeRemaining = $state(0);
+  let showTieBreakerConfirm = $state(false);
+  let tieBreakerConfirmAction = $state(null);
+  let tieBreakerConfirmMessage = $state('');
+
   let inLobby = $derived(selectedGame?.status === 'LOBBY_OPEN');
   let activePlayers = $derived(players.filter(p => p.game_id === selectedGameId && p.is_active));
   let activePlayerCount = $derived(activePlayers.length);
+
+  let isTieBreakerLobby = $derived(selectedGame?.tie_breaker_status === 'LOBBY_OPEN');
+  let isTieBreakerActive = $derived(selectedGame?.tie_breaker_status === 'ACTIVE');
+  let isTieBreakerCompleted = $derived(selectedGame?.tie_breaker_status === 'COMPLETED');
+  let isTieBreakerUnresolved = $derived(selectedGame?.tie_breaker_status === 'UNRESOLVED');
+  let hasTie = $derived(() => {
+    if (!selectedGame || selectedGame.status !== 'COMPLETED') return false;
+    if (selectedGame.tie_breaker_status !== 'NONE') return false;
+    const topScore = Math.max(...players.filter(p => p.game_id === selectedGameId && p.is_active).map(p => p.score), 0);
+    const tiedCount = players.filter(p => p.game_id === selectedGameId && p.is_active && p.score === topScore).length;
+    return tiedCount >= 2 && topScore > 0;
+  });
+  let eligibleTBPlayers = $derived(
+    (selectedGame?.tie_breaker_participants || []).filter(p => !p.is_kicked)
+  );
 
   function getStatusColor(status) {
     const colors = {
@@ -183,6 +207,10 @@
     qrDataUrl = '';
     joinUrl = '';
     questionsLoaded = false;
+    tieBreakerParticipants = [];
+    if (tieBreakerTimer) clearInterval(tieBreakerTimer);
+    if (tieBreakerCountdownInterval) clearInterval(tieBreakerCountdownInterval);
+    tieBreakerCountdown = null;
   }
 
   async function loadAllGames() {
@@ -339,6 +367,15 @@
 
     await loadPlayersForGame(selectedGameId);
     await loadLeaderboard(selectedGameId);
+    if (data && data.tie_breaker_participants) {
+      tieBreakerParticipants = data.tie_breaker_participants;
+    }
+    if (data && data.tie_breaker_status === 'ACTIVE' && data.tie_breaker_deadline) {
+      startTieBreakerTimer();
+    } else if (tieBreakerTimer) {
+      clearInterval(tieBreakerTimer);
+      tieBreakerTimer = null;
+    }
   }
 
   function showConfirm(message, action) {
@@ -739,6 +776,138 @@
     }
   }
 
+  async function openTieBreakerLobby() {
+    if (!selectedGameId || isProcessing) return;
+    isProcessing = true;
+    try {
+      const { data, error } = await supabase.rpc('open_tiebreaker_lobby', {
+        p_game_id: selectedGameId
+      });
+      if (error) throw error;
+      if (data?.success) {
+        tieBreakerParticipants = data.participants || [];
+        await refreshSelectedGame();
+      } else {
+        console.error('Open tie-breaker lobby error:', data?.error, data?.message);
+      }
+    } catch (e) {
+      console.error('Open tie-breaker lobby failed:', e);
+    } finally {
+      isProcessing = false;
+    }
+  }
+
+  async function startTieBreaker() {
+    if (!selectedGameId || isProcessing) return;
+    isProcessing = true;
+    try {
+      const { data, error } = await supabase.rpc('start_tiebreaker', {
+        p_game_id: selectedGameId
+      });
+      if (error) throw error;
+      if (data?.success) {
+        await refreshSelectedGame();
+        tieBreakerCountdown = 5;
+        tieBreakerCountdownInterval = setInterval(async () => {
+          tieBreakerCountdown = tieBreakerCountdown - 1;
+          if (tieBreakerCountdown <= 0) {
+            clearInterval(tieBreakerCountdownInterval);
+            tieBreakerCountdownInterval = null;
+            tieBreakerCountdown = null;
+            await refreshSelectedGame();
+          }
+        }, 1000);
+      }
+    } catch (e) {
+      console.error('Start tie-breaker failed:', e);
+    } finally {
+      isProcessing = false;
+    }
+  }
+
+  function startTieBreakerTimer() {
+    if (tieBreakerTimer) clearInterval(tieBreakerTimer);
+    const deadline = selectedGame?.tie_breaker_deadline;
+    if (!deadline) return;
+
+    tieBreakerTimer = setInterval(() => {
+      const now = Date.now() - serverTimeOffset;
+      const dl = new Date(deadline).getTime();
+      const remaining = Math.max(0, Math.floor((dl - now) / 1000));
+      tieBreakerTimeRemaining = remaining;
+
+      if (remaining <= 0) {
+        clearInterval(tieBreakerTimer);
+        tieBreakerTimer = null;
+        lockExpiredTieBreaker();
+      }
+    }, 100);
+  }
+
+  async function lockExpiredTieBreaker() {
+    if (!selectedGameId) return;
+    try {
+      await supabase.rpc('lock_expired_tiebreaker', { p_game_id: selectedGameId });
+      await refreshSelectedGame();
+    } catch (e) {
+      console.error('Lock expired tie-breaker failed:', e);
+    }
+  }
+
+  async function advanceTieBreaker() {
+    if (!selectedGameId || isProcessing) return;
+    isProcessing = true;
+    try {
+      const { data, error } = await supabase.rpc('advance_tiebreaker', {
+        p_game_id: selectedGameId
+      });
+      if (error) throw error;
+      if (data?.success) {
+        await refreshSelectedGame();
+      }
+    } catch (e) {
+      console.error('Advance tie-breaker failed:', e);
+    } finally {
+      isProcessing = false;
+    }
+  }
+
+  function cancelTieBreaker() {
+    showConfirm('Cancel the tie breaker? This cannot be undone.', async () => {
+      isProcessing = true;
+      try {
+        await supabase.rpc('cancel_tiebreaker', { p_game_id: selectedGameId });
+        tieBreakerParticipants = [];
+        await refreshSelectedGame();
+      } catch (e) {
+        console.error('Cancel tie-breaker failed:', e);
+      } finally {
+        isProcessing = false;
+      }
+    });
+  }
+
+  function kickTieBreakerPlayer(playerId, playerName) {
+    showConfirm(`Remove ${playerName} from the tie breaker lobby?`, async () => {
+      isProcessing = true;
+      try {
+        const { data, error } = await supabase.rpc('kick_tiebreaker_player', {
+          p_game_id: selectedGameId,
+          p_player_id: playerId
+        });
+        if (error) throw error;
+        if (data?.success) {
+          tieBreakerParticipants = data.participants || [];
+          await refreshSelectedGame();
+        }
+      } catch (e) {
+        console.error('Kick tie-breaker player failed:', e);
+      } finally {
+        isProcessing = false;
+      }
+    });
+  }
+
   function setupRealtimeSubscriptions() {
     cleanupSubscriptions();
 
@@ -766,6 +935,13 @@
               }
               if (payload.new.status !== 'PLAYING' && timerInterval) {
                 clearInterval(timerInterval);
+              }
+              if (payload.new.tie_breaker_status === 'ACTIVE' && payload.new.tie_breaker_deadline) {
+                startTieBreakerTimer();
+              }
+              if (payload.new.tie_breaker_status !== 'ACTIVE' && tieBreakerTimer) {
+                clearInterval(tieBreakerTimer);
+                tieBreakerTimer = null;
               }
               if (payload.new.status === 'LOBBY_OPEN') {
                 generateQR();
@@ -838,6 +1014,8 @@
       cleanupSubscriptions();
       if (timerInterval) clearInterval(timerInterval);
       if (countdownInterval) clearInterval(countdownInterval);
+      if (tieBreakerTimer) clearInterval(tieBreakerTimer);
+      if (tieBreakerCountdownInterval) clearInterval(tieBreakerCountdownInterval);
     };
   });
 </script>
@@ -1047,6 +1225,239 @@
           </div>
         </div>
 
+      <!-- ========== TIE BREAKER LOBBY VIEW ========== -->
+      {:else if (isTieBreakerLobby || isTieBreakerActive || isTieBreakerCompleted || isTieBreakerUnresolved) && selectedGame}
+        <div class="animate-fade-in">
+          {#if isTieBreakerLobby}
+            <!-- Tie Breaker Lobby -->
+            <div class="text-center mb-6">
+              <div class="inline-block px-6 py-2 rounded-full bg-amber-50 border border-amber-200 mb-3">
+                <span class="text-lg font-bold text-amber-700 tracking-[0.3em]">
+                  TIE BREAKER LOBBY
+                </span>
+              </div>
+            </div>
+
+            <div class="grid grid-cols-12 gap-6">
+              <div class="col-span-5 flex flex-col items-center gap-6">
+                <div class="glass-strong rounded-2xl p-8 text-center space-y-4">
+                  <div class="text-5xl">&#x1F3C6;</div>
+                  <div>
+                    <p class="text-sm text-gray-500 uppercase tracking-wider">Top Score</p>
+                    <p class="text-4xl font-black text-amber-600">{eligibleTBPlayers[0]?.score || 0} / 20</p>
+                  </div>
+                  <div>
+                    <p class="text-sm text-gray-500 uppercase tracking-wider">Qualified Players</p>
+                    <p class="text-3xl font-bold text-gray-900">{eligibleTBPlayers.length}</p>
+                  </div>
+                </div>
+              </div>
+
+              <div class="col-span-7">
+                <div class="glass-strong rounded-2xl p-5 h-full">
+                  <h3 class="text-sm font-semibold text-gray-500 uppercase tracking-wider mb-4 flex items-center gap-2">
+                    <Users size={16} />
+                    Qualified Players
+                  </h3>
+
+                  <div class="space-y-1 max-h-[calc(100vh-350px)] overflow-y-auto pr-2">
+                    {#each (selectedGame.tie_breaker_participants || []) as participant, i (participant.player_id)}
+                      <div class="flex items-center gap-3 py-2.5 px-3 rounded-lg {participant.is_kicked ? 'bg-red-50 opacity-50' : 'hover:bg-gray-50'} transition-colors group">
+                        <span class="text-xs text-gray-400 font-mono w-6 text-right">{String(i + 1).padStart(2, '0')}</span>
+                        <span class="flex-1 font-medium {participant.is_kicked ? 'text-gray-400 line-through' : 'text-gray-900'}">
+                          {participant.name}
+                          {#if participant.is_kicked}
+                            <span class="text-xs text-red-500 ml-2">(removed)</span>
+                          {/if}
+                        </span>
+                        <span class="text-sm font-bold {participant.is_kicked ? 'text-gray-300' : 'text-amber-600'}">
+                          {participant.score} / 20
+                        </span>
+                        {#if !participant.is_kicked}
+                          <button
+                            onclick={() => kickTieBreakerPlayer(participant.player_id, participant.name)}
+                            class="p-1.5 rounded-lg opacity-0 group-hover:opacity-100 hover:bg-red-50 text-gray-300 hover:text-red-500 transition-all"
+                            title="Remove from tie-breaker"
+                          >
+                            <Trash2 size={14} />
+                          </button>
+                        {/if}
+                      </div>
+                    {:else}
+                      <div class="py-12 text-center text-gray-400">
+                        <Users size={32} class="mx-auto mb-3 opacity-30" />
+                        <p>No qualified players</p>
+                      </div>
+                    {/each}
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="flex gap-4 mt-6 justify-center">
+              <button
+                onclick={cancelTieBreaker}
+                disabled={isProcessing}
+                class="flex items-center justify-center gap-2 px-8 py-3.5 rounded-xl border-2 border-red-300 bg-white hover:bg-red-50 hover:border-red-400 disabled:bg-gray-100 disabled:border-gray-200 disabled:text-gray-400 text-red-600 font-semibold transition-all active:scale-[0.98]"
+              >
+                <X size={18} />
+                CANCEL TIE BREAKER
+              </button>
+
+              <button
+                onclick={startTieBreaker}
+                disabled={isProcessing || eligibleTBPlayers.length < 2}
+                class="flex items-center justify-center gap-2 px-12 py-3.5 rounded-xl bg-amber-500 hover:bg-amber-600 disabled:bg-gray-200 disabled:text-gray-400 text-white font-bold text-lg transition-all active:scale-[0.98] shadow-lg shadow-amber-500/25"
+              >
+                <Play size={20} />
+                START TIE BREAKER
+              </button>
+            </div>
+
+            {#if eligibleTBPlayers.length < 2}
+              <p class="text-center text-amber-600 text-sm mt-4">
+                Need at least 2 eligible players to start. {eligibleTBPlayers.length} currently eligible.
+              </p>
+            {/if}
+
+          {:else if isTieBreakerActive}
+            <!-- Tie Breaker Active -->
+            {#if tieBreakerCountdown !== null}
+              <div class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
+                <div class="text-center animate-scale-in">
+                  <div class="text-9xl font-black text-amber-500 animate-countdown select-none">
+                    {tieBreakerCountdown}
+                  </div>
+                  <p class="text-gray-300 text-xl mt-4">Tie Breaker Starting...</p>
+                </div>
+              </div>
+            {/if}
+
+            <div class="text-center mb-6">
+              <div class="inline-block px-6 py-2 rounded-full bg-amber-50 border border-amber-200 mb-3">
+                <span class="text-lg font-bold text-amber-700 tracking-[0.3em]">
+                  TIE BREAKER — QUESTION {selectedGame.tie_breaker_question_number} / 5
+                </span>
+              </div>
+            </div>
+
+            <div class="grid grid-cols-12 gap-6">
+              <div class="col-span-5 space-y-6">
+                <div class="glass-strong rounded-2xl p-5">
+                  <h3 class="text-sm font-semibold text-gray-500 uppercase tracking-wider mb-4 flex items-center gap-2">
+                    <Timer size={16} />
+                    Timer
+                  </h3>
+                  <div class="text-center">
+                    <div class="text-4xl font-mono font-bold {tieBreakerTimeRemaining <= 10 ? 'text-red-500 animate-pulse' : 'text-gray-900'}">
+                      {formatTime(tieBreakerTimeRemaining)}
+                    </div>
+                  </div>
+                </div>
+
+                <div class="glass-strong rounded-2xl p-5">
+                  <h3 class="text-sm font-semibold text-gray-500 uppercase tracking-wider mb-4 flex items-center gap-2">
+                    <Users size={16} />
+                    Competing ({eligibleTBPlayers.filter(p => !p.is_kicked).length})
+                  </h3>
+                  <div class="space-y-1">
+                    {#each eligibleTBPlayers.filter(p => !p.is_kicked) as player}
+                      <div class="flex items-center gap-3 py-2 px-3 rounded-lg hover:bg-gray-50">
+                        <span class="text-amber-600 font-bold">{player.score}</span>
+                        <span class="text-gray-900">{player.name}</span>
+                      </div>
+                    {/each}
+                  </div>
+                </div>
+
+                <button
+                  onclick={advanceTieBreaker}
+                  disabled={isProcessing}
+                  class="w-full flex items-center justify-center gap-2 py-3 rounded-xl bg-amber-500 hover:bg-amber-400 disabled:bg-gray-100 disabled:text-gray-400 text-white font-semibold transition-all active:scale-[0.98]"
+                >
+                  <SkipForward size={18} />
+                  NEXT TIE BREAKER QUESTION
+                </button>
+              </div>
+
+              <div class="col-span-7">
+                {#if selectedGame.tie_breaker_question_id}
+                  {@const tbQ = (questions[selectedGame.game_number] || []).concat(questions.tiebreakers || []).find(q => q.id === selectedGame.tie_breaker_question_id)}
+                  {#if tbQ}
+                    <div class="glass-strong rounded-2xl p-5">
+                      <h3 class="text-sm font-semibold text-gray-500 uppercase tracking-wider mb-4 flex items-center gap-2">
+                        <FileText size={16} />
+                        Current Tie Breaker Question
+                      </h3>
+                      <div class="bg-gray-50 rounded-xl p-4 text-center border border-gray-100 mb-4">
+                        <p class="text-2xl font-black tracking-widest text-gray-900 select-none">
+                          {tbQ.jumbled_word}
+                        </p>
+                      </div>
+                      <div class="space-y-2">
+                        <div class="flex items-center gap-2">
+                          <CheckCircle size={14} class="text-green-600" />
+                          <span class="text-sm text-gray-600">Answer:</span>
+                          <span class="text-sm font-bold text-green-600">{tbQ.correct_word}</span>
+                        </div>
+                        <div class="flex items-center gap-2">
+                          <Lightbulb size={14} class="text-amber-500" />
+                          <span class="text-sm text-gray-600">Hint:</span>
+                          <span class="text-sm text-gray-700">{tbQ.hint}</span>
+                        </div>
+                      </div>
+                    </div>
+                  {:else}
+                    <div class="glass-strong rounded-2xl p-5 text-center text-gray-400">Loading question...</div>
+                  {/if}
+                {:else}
+                  <div class="glass-strong rounded-2xl p-5 text-center text-gray-400">No active question</div>
+                {/if}
+              </div>
+            </div>
+
+          {:else if isTieBreakerCompleted}
+            <!-- Tie Breaker Completed -->
+            <div class="text-center mb-6">
+              <div class="inline-block px-6 py-2 rounded-full bg-green-50 border border-green-200 mb-3">
+                <span class="text-lg font-bold text-green-700 tracking-[0.3em]">
+                  TIE BREAKER COMPLETE
+                </span>
+              </div>
+            </div>
+
+            <div class="glass-strong rounded-2xl p-8 text-center max-w-lg mx-auto space-y-4">
+              {#if selectedGame.tie_breaker_winner_id}
+                {@const winner = players.find(p => p.id === selectedGame.tie_breaker_winner_id)}
+                <div class="text-5xl mb-2">&#x1F3C6;</div>
+                <h2 class="text-3xl font-bold text-gray-900">Champion!</h2>
+                <p class="text-2xl font-bold text-amber-600">{winner?.name || 'Unknown'}</p>
+                <p class="text-gray-500">Won the tie breaker with {winner?.score || 0} / 20</p>
+              {:else}
+                <div class="text-5xl mb-2">&#x1F91D;</div>
+                <h2 class="text-2xl font-bold text-gray-900">Tie Unresolved</h2>
+                <p class="text-gray-500">No player answered all tie-breaker questions correctly.</p>
+              {/if}
+            </div>
+
+          {:else if isTieBreakerUnresolved}
+            <div class="text-center mb-6">
+              <div class="inline-block px-6 py-2 rounded-full bg-gray-100 border border-gray-200 mb-3">
+                <span class="text-lg font-bold text-gray-600 tracking-[0.3em]">
+                  TIE UNRESOLVED
+                </span>
+              </div>
+            </div>
+
+            <div class="glass-strong rounded-2xl p-8 text-center max-w-lg mx-auto space-y-4">
+              <div class="text-5xl mb-2">&#x1F91D;</div>
+              <h2 class="text-2xl font-bold text-gray-900">All Tie-Breaker Questions Exhausted</h2>
+              <p class="text-gray-500">No winner was determined from the tie-breaker round.</p>
+              <p class="text-sm text-gray-400">Top players with equal scores share the top position.</p>
+            </div>
+          {/if}
+        </div>
+
       <!-- ========== NORMAL DASHBOARD VIEW ========== -->
       {:else}
 
@@ -1160,6 +1571,17 @@
                     <RefreshCcw size={16} />
                     RESET GAME
                   </button>
+
+                  {#if selectedGame.status === 'COMPLETED' && hasTie && selectedGame.tie_breaker_status === 'NONE'}
+                    <button
+                      onclick={openTieBreakerLobby}
+                      disabled={isProcessing}
+                      class="w-full flex items-center justify-center gap-2 py-3 rounded-xl bg-amber-500 hover:bg-amber-400 disabled:bg-gray-100 disabled:text-gray-400 text-white font-semibold transition-all active:scale-[0.98]"
+                    >
+                      <Trophy size={18} />
+                      OPEN TIE BREAKER LOBBY
+                    </button>
+                  {/if}
                 </div>
               </div>
 

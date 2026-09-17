@@ -54,6 +54,28 @@
   let autoAdvanceTimer = null;
   let autoAdvancing = $state(false);
 
+  let isTieBreaker = $state(false);
+  let tieBreakerScreen = $state('NONE');
+  let tieBreakerQuestionNumber = $state(0);
+  let tieBreakerTotalQuestions = $state(5);
+  let tieBreakerJumbledWord = $state('');
+  let tieBreakerHint = $state('');
+  let tieBreakerTimeRemaining = $state(0);
+  let tieBreakerDeadline = $state(null);
+  let tieBreakerTimerInterval = null;
+  let tieBreakerAnswerInput = $state('');
+  let tieBreakerSubmitting = $state(false);
+  let tieBreakerWrongAnswer = $state(false);
+  let tieBreakerShowWrongMessage = $state(false);
+  let tieBreakerHintsUsed = $state(0);
+  let tieBreakerMaxHints = 2;
+  let tieBreakerWinnerName = $state('');
+  let tieBreakerCorrectAnswer = $state('');
+  let tieBreakerIsTimedOut = $state(false);
+  let isKicked = $state(false);
+  let kickedReason = $state('');
+  let tieBreakerAutoAdvanceTimer = null;
+
   function getOrCreateSession() {
     let stored = localStorage.getItem('wr_session');
     if (!stored) {
@@ -162,8 +184,34 @@
       loadCurrentQuestion();
     } else if (game.status === 'COMPLETED') {
       clearAllTimers();
-      clearAutoAdvance();
-      screen = 'GAME_COMPLETED';
+      isTieBreaker = false;
+      tieBreakerScreen = 'NONE';
+
+      if (game.tie_breaker_status === 'LOBBY_OPEN') {
+        if (checkTieBreakerKicked(game)) {
+          isKicked = true;
+          kickedReason = 'TIE_BREAKER';
+          screen = 'KICKED_OUT';
+        } else if (checkTieBreakerEligibility(game)) {
+          screen = 'TIE_BREAKER_LOBBY';
+        } else {
+          screen = 'GAME_COMPLETED';
+        }
+      } else if (game.tie_breaker_status === 'ACTIVE') {
+        if (checkTieBreakerKicked(game)) {
+          isKicked = true;
+          kickedReason = 'TIE_BREAKER';
+          screen = 'KICKED_OUT';
+        } else if (checkTieBreakerEligibility(game)) {
+          isTieBreaker = true;
+          screen = 'TIE_BREAKER_QUESTION';
+          loadTieBreakerQuestion();
+        } else {
+          screen = 'GAME_COMPLETED';
+        }
+      } else {
+        screen = 'GAME_COMPLETED';
+      }
     } else {
       screen = 'WAITING';
     }
@@ -222,7 +270,11 @@
             screen = 'REGISTRATION';
           }
         } else if (gameInfo.status === 'COMPLETED') {
-          screen = 'GAME_COMPLETED';
+          if (gameInfo.tie_breaker_status === 'LOBBY_OPEN' || gameInfo.tie_breaker_status === 'ACTIVE') {
+            screen = 'GAME_COMPLETED';
+          } else {
+            screen = 'GAME_COMPLETED';
+          }
         } else if (['PLAYING', 'QUESTION_LOCKED', 'COUNTDOWN'].includes(gameInfo.status)) {
           screen = 'GAME_PLAYING';
         } else {
@@ -479,6 +531,191 @@
     autoAdvancing = false;
   }
 
+  async function loadTieBreakerQuestion() {
+    if (!currentGame?.id) return;
+
+    console.log('[WORD RUSH Student] loadTieBreakerQuestion:', currentGame.tie_breaker_question_number);
+
+    tieBreakerQuestionNumber = currentGame.tie_breaker_question_number || 0;
+    tieBreakerDeadline = currentGame.tie_breaker_deadline;
+    tieBreakerWrongAnswer = false;
+    tieBreakerShowWrongMessage = false;
+
+    if (currentGame.tie_breaker_question_id) {
+      const { data: q } = await supabase
+        .from('questions')
+        .select('jumbled_word, hint')
+        .eq('id', currentGame.tie_breaker_question_id)
+        .single();
+
+      if (q) {
+        tieBreakerJumbledWord = q.jumbled_word;
+        tieBreakerHint = '';
+      }
+    }
+
+    const { data: playerData } = await supabase
+      .from('players')
+      .select('hints_used')
+      .eq('id', playerId)
+      .single();
+
+    if (playerData) {
+      tieBreakerHintsUsed = playerData.hints_used || 0;
+    }
+
+    startTieBreakerTimer();
+  }
+
+  function startTieBreakerTimer() {
+    if (tieBreakerTimerInterval) clearInterval(tieBreakerTimerInterval);
+    if (!tieBreakerDeadline) return;
+
+    tieBreakerTimerInterval = setInterval(() => {
+      const now = Date.now() - serverTimeOffset;
+      const deadline = new Date(tieBreakerDeadline).getTime();
+      const remaining = Math.max(0, Math.floor((deadline - now) / 1000));
+      tieBreakerTimeRemaining = remaining;
+
+      if (remaining <= 0) {
+        clearInterval(tieBreakerTimerInterval);
+        tieBreakerTimerInterval = null;
+        tieBreakerTimeRemaining = 0;
+        handleTieBreakerTimerExpired();
+      }
+    }, 100);
+  }
+
+  async function handleTieBreakerTimerExpired() {
+    if (!currentGame?.id) return;
+    try {
+      await supabase.rpc('lock_expired_tiebreaker', { p_game_id: currentGame.id });
+      await loadTieBreakerResult();
+      tieBreakerScreen = 'RESULT';
+    } catch (e) {
+      console.error('[WORD RUSH Student] lock_expired_tiebreaker failed:', e);
+    }
+  }
+
+  async function loadTieBreakerResult() {
+    if (!currentGame?.id || !currentGame.tie_breaker_question_id) return;
+
+    const { data: result } = await supabase
+      .from('question_results')
+      .select('winner_player_id, result_type')
+      .eq('game_id', currentGame.id)
+      .eq('question_id', currentGame.tie_breaker_question_id)
+      .maybeSingle();
+
+    if (result) {
+      if (result.result_type === 'TIEBREAKER' && result.winner_player_id) {
+        tieBreakerIsTimedOut = false;
+        const { data: winnerPlayer } = await supabase
+          .from('players')
+          .select('name')
+          .eq('id', result.winner_player_id)
+          .single();
+        if (winnerPlayer) tieBreakerWinnerName = winnerPlayer.name;
+      } else {
+        tieBreakerIsTimedOut = true;
+        tieBreakerWinnerName = '';
+      }
+    } else {
+      tieBreakerIsTimedOut = true;
+      tieBreakerWinnerName = '';
+    }
+
+    const { data: q } = await supabase
+      .from('questions')
+      .select('correct_word')
+      .eq('id', currentGame.tie_breaker_question_id)
+      .single();
+    if (q) tieBreakerCorrectAnswer = q.correct_word;
+  }
+
+  function scheduleTieBreakerAutoAdvance() {
+    if (tieBreakerAutoAdvanceTimer) clearTimeout(tieBreakerAutoAdvanceTimer);
+    tieBreakerAutoAdvanceTimer = setTimeout(async () => {
+      if (!currentGame?.id) return;
+      try {
+        const { data } = await supabase.rpc('advance_tiebreaker', {
+          p_game_id: currentGame.id
+        });
+        if (data?.success) {
+          await syncGameState();
+        }
+      } catch (e) {
+        console.error('[WORD RUSH Student] auto-advance tie-breaker failed:', e);
+      }
+    }, 3000);
+  }
+
+  async function submitTieBreakerAnswer() {
+    if (!tieBreakerAnswerInput.trim() || tieBreakerSubmitting || tieBreakerTimeRemaining <= 0) return;
+
+    tieBreakerSubmitting = true;
+    tieBreakerShowWrongMessage = false;
+    tieBreakerWrongAnswer = false;
+
+    try {
+      const { data, error: rpcError } = await supabase.rpc('submit_tiebreaker_answer', {
+        p_player_id: playerId,
+        p_game_id: currentGame.id,
+        p_question_id: currentGame.tie_breaker_question_id,
+        p_answer: tieBreakerAnswerInput.trim()
+      });
+
+      if (rpcError) throw rpcError;
+
+      if (data?.error) {
+        if (data.error === 'WINNER_EXISTS' || data.error === 'NOT_ACTIVE') {
+          tieBreakerAnswerInput = '';
+          await loadTieBreakerResult();
+          tieBreakerScreen = 'RESULT';
+        } else if (data.message === 'Incorrect answer') {
+          tieBreakerWrongAnswer = true;
+          tieBreakerShowWrongMessage = true;
+          setTimeout(() => { tieBreakerShowWrongMessage = false; }, 2000);
+        }
+      } else {
+        if (data?.won) {
+          tieBreakerCorrectAnswer = '';
+          await loadTieBreakerResult();
+          tieBreakerScreen = 'RESULT';
+        }
+        tieBreakerAnswerInput = '';
+      }
+    } catch (e) {
+      console.error('[WORD RUSH Student] Submit tie-breaker answer failed:', e);
+    } finally {
+      tieBreakerSubmitting = false;
+    }
+  }
+
+  async function requestTieBreakerHint() {
+    if (tieBreakerHintsUsed >= tieBreakerMaxHints) return;
+    try {
+      const { data, error: rpcError } = await supabase.rpc('request_hint', {
+        p_player_id: playerId,
+        p_game_id: currentGame.id,
+        p_question_id: currentGame.tie_breaker_question_id
+      });
+      if (rpcError) throw rpcError;
+      if (data?.success && data?.hint) {
+        tieBreakerHint = data.hint;
+        tieBreakerHintsUsed = (tieBreakerHintsUsed || 0) + 1;
+      }
+    } catch (e) {
+      console.error('[WORD RUSH Student] Tie-breaker hint request failed:', e);
+    }
+  }
+
+  function handleTieBreakerAnswerKeydown(e) {
+    if (e.key === 'Enter' && !tieBreakerSubmitting && tieBreakerTimeRemaining > 0) {
+      submitTieBreakerAnswer();
+    }
+  }
+
   function startSyncedCountdown(startedAt) {
     clearAllTimers();
     screen = 'COUNTDOWN';
@@ -557,7 +794,29 @@
       clearInterval(timerInterval);
       timerInterval = null;
     }
+    if (tieBreakerTimerInterval) {
+      clearInterval(tieBreakerTimerInterval);
+      tieBreakerTimerInterval = null;
+    }
+    if (tieBreakerAutoAdvanceTimer) {
+      clearTimeout(tieBreakerAutoAdvanceTimer);
+      tieBreakerAutoAdvanceTimer = null;
+    }
     clearCountdown();
+  }
+
+  function checkTieBreakerEligibility(game) {
+    if (!game || !playerId) return false;
+    const participants = game.tie_breaker_participants || [];
+    const me = participants.find(p => p.player_id === playerId);
+    return me && !me.is_kicked;
+  }
+
+  function checkTieBreakerKicked(game) {
+    if (!game || !playerId) return false;
+    const participants = game.tie_breaker_participants || [];
+    const me = participants.find(p => p.player_id === playerId);
+    return me && me.is_kicked;
   }
 
   function formatTime(seconds) {
@@ -806,6 +1065,8 @@
       cleanupSubscriptions();
       clearAllTimers();
       clearAutoAdvance();
+      if (tieBreakerTimerInterval) clearInterval(tieBreakerTimerInterval);
+      if (tieBreakerAutoAdvanceTimer) clearTimeout(tieBreakerAutoAdvanceTimer);
     };
   });
 
@@ -1116,6 +1377,158 @@
           Game In Progress
         </h2>
         <p class="text-gray-500">Please wait for the next round.</p>
+      </div>
+    </div>
+  </div>
+
+{:else if screen === 'TIE_BREAKER_LOBBY'}
+  <div class="min-h-screen flex items-center justify-center p-4">
+    <div class="w-full max-w-md animate-scale-in text-center space-y-6">
+      <h1 class="text-4xl font-bold tracking-tight text-amber-600">WORD RUSH</h1>
+      <div class="glass-strong rounded-2xl p-8 space-y-4">
+        <div class="text-5xl mb-4">&#x1F3C6;</div>
+        <h2 class="text-2xl font-bold text-gray-900">TIE BREAKER</h2>
+        <p class="text-amber-600 font-semibold">You're qualified!</p>
+        <p class="text-gray-500 text-sm">Waiting for the host to start...</p>
+      </div>
+    </div>
+  </div>
+
+{:else if screen === 'TIE_BREAKER_QUESTION'}
+  <div class="min-h-screen flex flex-col p-4 max-w-lg mx-auto">
+    <div class="flex items-center justify-between mb-4">
+      <span class="text-xs text-amber-600 font-semibold uppercase tracking-wider">Tie Breaker</span>
+      <span class="text-xs text-gray-400">
+        QUESTION {tieBreakerQuestionNumber} / {tieBreakerTotalQuestions}
+      </span>
+    </div>
+
+    <div class="flex-1 flex flex-col items-center justify-center gap-6">
+      {#if !tieBreakerJumbledWord}
+        <div class="glass-strong rounded-2xl p-6 w-full text-center">
+          <div class="inline-block w-8 h-8 border-4 border-amber-500 border-t-transparent rounded-full animate-spin mb-3"></div>
+          <p class="text-gray-500 text-sm">Loading question...</p>
+        </div>
+      {:else}
+        <div class="glass-strong rounded-2xl p-6 w-full text-center">
+          <p class="text-xs text-amber-600 uppercase tracking-widest mb-4">Unscramble this word</p>
+          <div class="text-3xl sm:text-4xl font-black tracking-widest text-gray-900 select-none py-4">
+            {tieBreakerJumbledWord}
+          </div>
+        </div>
+
+        {#if tieBreakerHint}
+          <div class="w-full glass rounded-xl px-4 py-3 border border-amber-200 bg-amber-50">
+            <p class="text-xs text-amber-600 uppercase tracking-wider mb-1">Hint</p>
+            <p class="text-sm text-amber-700">{tieBreakerHint}</p>
+          </div>
+        {/if}
+
+        <div class="w-full glass rounded-2xl p-5 space-y-4">
+          <div class="flex items-center justify-between">
+            <div class="flex items-center gap-2">
+              <div class="text-2xl font-mono font-bold {tieBreakerTimeRemaining <= 10 ? 'text-red-500 animate-pulse' : 'text-gray-900'}">
+                {formatTime(tieBreakerTimeRemaining)}
+              </div>
+            </div>
+            <div class="text-xs text-gray-400">
+              Hints Left: {tieBreakerMaxHints - tieBreakerHintsUsed}
+            </div>
+          </div>
+
+          <div class="relative">
+            <input
+              type="text"
+              bind:value={tieBreakerAnswerInput}
+              onkeydown={handleTieBreakerAnswerKeydown}
+              placeholder="Type your answer..."
+              disabled={tieBreakerSubmitting || tieBreakerTimeRemaining <= 0}
+              autocomplete="off"
+              autocapitalize="off"
+              autocorrect="off"
+              spellcheck="false"
+              class="w-full px-5 py-4 rounded-xl bg-white border-2 {tieBreakerWrongAnswer ? 'border-red-400' : 'border-gray-200 focus:border-amber-500'} text-gray-900 text-xl text-center tracking-wide placeholder-gray-300 transition-all outline-none"
+            />
+          </div>
+
+          {#if tieBreakerShowWrongMessage}
+            <p class="text-center text-red-500 text-sm font-medium animate-fade-in">
+              Wrong Answer - Try Again!
+            </p>
+          {/if}
+
+          <div class="flex gap-3">
+            <button
+              onclick={requestTieBreakerHint}
+              disabled={tieBreakerHintsUsed >= tieBreakerMaxHints || tieBreakerTimeRemaining <= 0}
+              class="flex-shrink-0 px-4 py-3 rounded-xl bg-gray-100 border border-gray-200 text-gray-600 disabled:text-gray-300 disabled:border-gray-100 text-sm font-medium transition-all active:scale-[0.98]"
+            >
+              Get Hint
+            </button>
+            <button
+              onclick={submitTieBreakerAnswer}
+              disabled={tieBreakerSubmitting || !tieBreakerAnswerInput.trim() || tieBreakerTimeRemaining <= 0}
+              class="flex-1 py-3 rounded-xl bg-amber-500 hover:bg-amber-600 disabled:bg-gray-200 disabled:text-gray-400 text-white font-semibold text-lg transition-all active:scale-[0.98] shadow-lg shadow-amber-500/25"
+            >
+              {#if tieBreakerSubmitting}
+                <span class="inline-block w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin"></span>
+              {:else}
+                SUBMIT
+              {/if}
+            </button>
+          </div>
+
+          {#if tieBreakerTimeRemaining <= 0}
+            <p class="text-center text-red-500 font-bold text-lg animate-fade-in">TIME'S UP!</p>
+          {/if}
+        </div>
+      {/if}
+    </div>
+  </div>
+
+{:else if screen === 'TIE_BREAKER_RESULT'}
+  <div class="min-h-screen flex items-center justify-center p-4">
+    <div class="w-full max-w-md animate-scale-in text-center space-y-6">
+      <div class="glass-strong rounded-2xl p-8 space-y-4">
+        <div class="text-xs text-amber-600 font-semibold uppercase tracking-wider mb-2">Tie Breaker</div>
+        {#if tieBreakerIsTimedOut}
+          <div class="text-3xl font-bold text-red-500">Time's Up!</div>
+        {:else if tieBreakerWinnerName}
+          <div class="space-y-2">
+            <div class="text-2xl font-bold text-gray-900">{tieBreakerWinnerName}</div>
+            <p class="text-amber-600 font-semibold">won the tie breaker!</p>
+          </div>
+        {:else}
+          <div class="text-2xl font-bold text-gray-400">No one answered in time</div>
+        {/if}
+
+        {#if tieBreakerCorrectAnswer}
+          <div class="pt-2">
+            <p class="text-xs text-gray-400 uppercase tracking-wider mb-1">Correct Answer</p>
+            <p class="text-3xl font-black tracking-widest text-emerald-600">{tieBreakerCorrectAnswer}</p>
+          </div>
+        {/if}
+      </div>
+
+      <p class="text-gray-400 text-sm animate-pulse">Waiting for next question...</p>
+    </div>
+  </div>
+
+{:else if screen === 'KICKED_OUT'}
+  <div class="min-h-screen flex items-center justify-center p-4">
+    <div class="w-full max-w-md animate-scale-in text-center space-y-6">
+      <div>
+        <h1 class="text-4xl font-bold tracking-tight text-purple-700">WORD RUSH</h1>
+      </div>
+      <div class="glass-strong rounded-2xl p-8 space-y-4">
+        <div class="text-5xl mb-4">&#x1F6AB;</div>
+        {#if kickedReason === 'TIE_BREAKER'}
+          <h2 class="text-2xl font-bold text-gray-900">Removed from Tie Breaker</h2>
+          <p class="text-gray-500">The host has removed you from the tie breaker.</p>
+        {:else}
+          <h2 class="text-2xl font-bold text-gray-900">You've Been Removed</h2>
+          <p class="text-gray-500">The host has removed you from this lobby.</p>
+        {/if}
       </div>
     </div>
   </div>
