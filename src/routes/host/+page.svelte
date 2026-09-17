@@ -40,6 +40,8 @@
   let qrDataUrl = $state('');
   let joinUrl = $state('');
 
+  let playersLoadSeq = $state(0);
+
   let showQuestionBank = $state(false);
   let questionsLoaded = $state(false);
 
@@ -195,14 +197,16 @@
   }
 
   async function loadPlayersForGame(gameId) {
+    const seq = ++playersLoadSeq;
     const { data, error } = await supabase
       .from('players')
       .select('*')
       .eq('game_id', gameId)
       .order('joined_at', { ascending: true });
 
-    if (!error && data) {
+    if (!error && data && seq === playersLoadSeq) {
       players = data;
+      console.log('[WORD RUSH Host] players loaded:', data.length);
     }
   }
 

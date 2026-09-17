@@ -4,6 +4,7 @@
   let { gameNumber } = $props();
 
   const supabase = getSupabase();
+  const COUNTDOWN_SECONDS = 5;
 
   let screen = $state('LOADING');
   let loading = $state(true);
@@ -17,7 +18,6 @@
   let currentGame = $state(null);
   let players = $state([]);
   let playerCount = $state(0);
-  let playersLoadSeq = $state(0);
 
   let questionNumber = $state(0);
   let totalQuestions = $state(20);
@@ -29,15 +29,24 @@
   let maxHints = 2;
   let wrongAnswer = $state(false);
   let showWrongMessage = $state(false);
+
   let timeRemaining = $state(0);
   let serverTimeOffset = $state(0);
   let questionDeadline = $state(null);
   let timerInterval = null;
+
   let countdownNumber = $state(null);
+  let countdownInterval = null;
+  let countdownDeadline = $state(null);
+
   let questionWinner = $state(null);
   let winnerName = $state('');
   let correctAnswer = $state('');
   let isTimedOut = $state(false);
+
+  let gameLoadSeq = 0;
+  let playersLoadSeq = 0;
+  let questionLoadSeq = 0;
 
   let subscriptions = $state([]);
 
@@ -60,21 +69,81 @@
         serverTimeOffset = Date.now() - data - rtt / 2;
       }
     } catch (e) {
-      console.warn('Could not sync server time:', e);
+      console.warn('[WORD RUSH Student] Could not sync server time:', e);
     }
   }
 
-  async function refreshGameState() {
-    if (!currentGame?.id) return null;
-    const { data: game } = await supabase
-      .from('games')
-      .select('*')
-      .eq('id', currentGame.id)
-      .single();
-    if (game) {
-      currentGame = { ...currentGame, ...game };
+  async function syncGameState() {
+    const seq = ++gameLoadSeq;
+    try {
+      const { data: game, error: fetchError } = await supabase
+        .from('games')
+        .select('*')
+        .eq('game_number', gameNumber)
+        .single();
+
+      if (fetchError || !game) {
+        console.error('[WORD RUSH Student] syncGameState: fetch failed', fetchError);
+        return;
+      }
+
+      if (seq !== gameLoadSeq) {
+        console.log('[WORD RUSH Student] syncGameState: stale response, discarding');
+        return;
+      }
+
+      console.log('[WORD RUSH Student] syncGameState: status =', game.status, 'screen before =', screen);
+      currentGame = game;
+      mapStatusToScreen(game);
+      console.log('[WORD RUSH Student] syncGameState: screen after =', screen);
+    } catch (e) {
+      console.error('[WORD RUSH Student] syncGameState error:', e);
     }
-    return game;
+  }
+
+  function mapStatusToScreen(game) {
+    if (game.status === 'LOBBY_OPEN') {
+      clearAllTimers();
+      screen = 'LOBBY';
+      loadPlayers(game.id);
+    } else if (game.status === 'LOBBY_CLOSED') {
+      clearAllTimers();
+      screen = 'LOBBY';
+      loadPlayers(game.id);
+    } else if (game.status === 'COUNTDOWN') {
+      clearAllTimers();
+      if (game.started_at) {
+        const now = Date.now() - serverTimeOffset;
+        const startedAtMs = new Date(game.started_at).getTime();
+        const elapsed = (now - startedAtMs) / 1000;
+        const remaining = Math.max(0, COUNTDOWN_SECONDS - elapsed);
+
+        if (remaining > 0.05) {
+          startSyncedCountdown(game.started_at);
+        } else {
+          screen = 'COUNTDOWN';
+          countdownNumber = 'GO!';
+          setTimeout(() => syncGameState(), 500);
+        }
+      } else {
+        screen = 'COUNTDOWN';
+        countdownNumber = 'GET READY';
+        startLocalFallbackCountdown();
+      }
+    } else if (game.status === 'PLAYING' || game.status === 'QUESTION_LOCKED') {
+      clearAllTimers();
+      screen = 'PLAYING';
+      loadCurrentQuestion();
+    } else if (game.status === 'PAUSED') {
+      clearAllTimers();
+      screen = 'PLAYING';
+      loadCurrentQuestion();
+    } else if (game.status === 'COMPLETED') {
+      clearAllTimers();
+      screen = 'GAME_COMPLETED';
+    } else {
+      screen = 'WAITING';
+    }
   }
 
   async function checkSession() {
@@ -94,7 +163,7 @@
         return;
       }
 
-      console.log('[WORD RUSH Student] gameNumber:', gameNumber, 'gameId:', gameInfo.id, 'status:', gameInfo.status);
+      console.log('[WORD RUSH Student] checkSession: gameNumber:', gameNumber, 'gameId:', gameInfo.id, 'status:', gameInfo.status);
       currentGame = gameInfo;
 
       const { data: existing, error: fetchError } = await supabase
@@ -115,26 +184,7 @@
         console.log('[WORD RUSH Student] restored player:', existing.name, 'in game', gameNumber);
 
         await subscribeToGame(gameInfo.id);
-
-        if (gameInfo.status === 'LOBBY_OPEN') {
-          screen = 'LOBBY';
-          await loadPlayers(gameInfo.id);
-        } else if (gameInfo.status === 'LOBBY_CLOSED') {
-          screen = 'LOBBY';
-          await loadPlayers(gameInfo.id);
-        } else if (gameInfo.status === 'COUNTDOWN') {
-          await handleCountdownState();
-        } else if (gameInfo.status === 'PLAYING' || gameInfo.status === 'QUESTION_LOCKED') {
-          screen = 'PLAYING';
-          await loadCurrentQuestion();
-        } else if (gameInfo.status === 'PAUSED') {
-          screen = 'PLAYING';
-          await loadCurrentQuestion();
-        } else if (gameInfo.status === 'COMPLETED') {
-          screen = 'GAME_COMPLETED';
-        } else {
-          screen = 'WAITING';
-        }
+        mapStatusToScreen(gameInfo);
       } else {
         if (gameInfo.status === 'LOBBY_OPEN') {
           const { count } = await supabase
@@ -176,11 +226,13 @@
     if (!fetchError && seq === playersLoadSeq) {
       players = data || [];
       playerCount = players.length;
+      console.log('[WORD RUSH Student] player count:', playerCount);
     }
   }
 
   async function loadCurrentQuestion() {
     if (!currentGame?.id) return;
+    const seq = ++questionLoadSeq;
     const { data: game, error: fetchError } = await supabase
       .from('games')
       .select('current_question_number, current_question_id, question_deadline, question_started_at, total_questions, status')
@@ -188,6 +240,11 @@
       .single();
 
     if (fetchError || !game) return;
+
+    if (seq !== questionLoadSeq) {
+      console.log('[WORD RUSH Student] loadCurrentQuestion: stale response, discarding');
+      return;
+    }
 
     console.log('[WORD RUSH Student] loadCurrentQuestion:', game.current_question_number, 'status:', game.status);
 
@@ -241,24 +298,91 @@
     }, 100);
   }
 
+  function startSyncedCountdown(startedAt) {
+    clearAllTimers();
+    screen = 'COUNTDOWN';
+    countdownDeadline = new Date(startedAt).getTime() + COUNTDOWN_SECONDS * 1000;
+
+    function updateCountdown() {
+      const now = Date.now() - serverTimeOffset;
+      const remaining = Math.max(0, (countdownDeadline - now) / 1000);
+
+      if (remaining > 4.5) {
+        countdownNumber = 'GET READY';
+      } else if (remaining > 3.5) {
+        countdownNumber = '5';
+      } else if (remaining > 2.5) {
+        countdownNumber = '4';
+      } else if (remaining > 1.5) {
+        countdownNumber = '3';
+      } else if (remaining > 0.5) {
+        countdownNumber = '2';
+      } else if (remaining > 0) {
+        countdownNumber = '1';
+      } else {
+        countdownNumber = 'GO!';
+        clearCountdown();
+        console.log('[WORD RUSH Student] countdown finished, syncing game state');
+        setTimeout(() => syncGameState(), 500);
+        return;
+      }
+    }
+
+    updateCountdown();
+    countdownInterval = setInterval(updateCountdown, 100);
+    console.log('[WORD RUSH Student] synced countdown started from:', startedAt);
+  }
+
+  function startLocalFallbackCountdown() {
+    clearCountdown();
+    const steps = [
+      { text: 'GET READY', delay: 800 },
+      { text: '5', delay: 800 },
+      { text: '4', delay: 800 },
+      { text: '3', delay: 800 },
+      { text: '2', delay: 800 },
+      { text: '1', delay: 800 },
+      { text: 'GO!', delay: 500 }
+    ];
+
+    let i = 0;
+    function nextStep() {
+      if (i < steps.length) {
+        countdownNumber = steps[i].text;
+        i++;
+        countdownInterval = setTimeout(nextStep, steps[i - 1].delay);
+      } else {
+        countdownNumber = null;
+        syncGameState();
+      }
+    }
+    nextStep();
+  }
+
+  function clearCountdown() {
+    if (countdownInterval) {
+      if (typeof countdownInterval === 'number') {
+        clearInterval(countdownInterval);
+        clearTimeout(countdownInterval);
+      } else {
+        clearInterval(countdownInterval);
+      }
+      countdownInterval = null;
+    }
+  }
+
+  function clearAllTimers() {
+    if (timerInterval) {
+      clearInterval(timerInterval);
+      timerInterval = null;
+    }
+    clearCountdown();
+  }
+
   function formatTime(seconds) {
     const m = Math.floor(seconds / 60);
     const s = seconds % 60;
     return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
-  }
-
-  async function handleCountdownState() {
-    const game = await refreshGameState();
-    if (game && game.status === 'PLAYING') {
-      screen = 'PLAYING';
-      await loadCurrentQuestion();
-    } else if (game && game.status === 'COUNTDOWN') {
-      screen = 'COUNTDOWN';
-      startCountdown();
-    } else if (game) {
-      screen = 'PLAYING';
-      await loadCurrentQuestion();
-    }
   }
 
   async function joinGame() {
@@ -291,11 +415,11 @@
 
       playerId = data.player_id;
       currentGame = { id: data.game_id, game_number: data.game_number, status: 'LOBBY_OPEN' };
-      screen = 'LOBBY';
       await subscribeToGame(data.game_id);
       await loadPlayers(data.game_id);
+      mapStatusToScreen(currentGame);
     } catch (e) {
-      console.error('Join failed:', e);
+      console.error('[WORD RUSH Student] Join failed:', e);
       error = e.message || 'Failed to join. Please try again.';
     } finally {
       loading = false;
@@ -329,7 +453,7 @@
         answerInput = '';
       }
     } catch (e) {
-      console.error('Submit answer failed:', e);
+      console.error('[WORD RUSH Student] Submit answer failed:', e);
     } finally {
       submittingAnswer = false;
     }
@@ -352,7 +476,7 @@
         hintsUsed = (hintsUsed || 0) + 1;
       }
     } catch (e) {
-      console.error('Hint request failed:', e);
+      console.error('[WORD RUSH Student] Hint request failed:', e);
     }
   }
 
@@ -371,31 +495,11 @@
         const g = payload.new;
         console.log('[WORD RUSH Student] game UPDATE:', g.status);
         currentGame = { ...currentGame, ...g };
-
-        if (g.status === 'LOBBY_OPEN') {
-          screen = 'LOBBY';
-          await loadPlayers(gameId);
-        } else if (g.status === 'LOBBY_CLOSED') {
-          screen = 'LOBBY';
-          await loadPlayers(gameId);
-        } else if (g.status === 'COUNTDOWN') {
-          await handleCountdownState();
-        } else if (g.status === 'PLAYING') {
-          screen = 'PLAYING';
-          await loadCurrentQuestion();
-        } else if (g.status === 'QUESTION_LOCKED') {
-          if (screen !== 'PLAYING' && screen !== 'QUESTION_RESULT') {
-            screen = 'PLAYING';
-            await loadCurrentQuestion();
-          }
-        } else if (g.status === 'PAUSED') {
-          if (timerInterval) clearInterval(timerInterval);
-        } else if (g.status === 'COMPLETED') {
-          screen = 'GAME_COMPLETED';
-          if (timerInterval) clearInterval(timerInterval);
-        }
+        await syncGameState();
       })
-      .subscribe();
+      .subscribe((status) => {
+        console.log('[WORD RUSH Student] game subscription status:', status);
+      });
 
     subscriptions.push(gameChannel);
 
@@ -406,10 +510,13 @@
         schema: 'public',
         table: 'players',
         filter: `game_id=eq.${gameId}`
-      }, async () => {
+      }, async (payload) => {
+        console.log('[WORD RUSH Student] player event:', payload.eventType);
         await loadPlayers(gameId);
       })
-      .subscribe();
+      .subscribe((status) => {
+        console.log('[WORD RUSH Student] player subscription status:', status);
+      });
 
     subscriptions.push(playerChannel);
 
@@ -422,6 +529,7 @@
         filter: `game_id=eq.${gameId}`
       }, async (payload) => {
         const r = payload.new;
+        console.log('[WORD RUSH Student] result event:', r.result_type);
         if (r.result_type === 'NORMAL' && r.winner_player_id) {
           questionWinner = r.winner_player_id;
           isTimedOut = false;
@@ -447,44 +555,11 @@
           }
         }
       })
-      .subscribe();
+      .subscribe((status) => {
+        console.log('[WORD RUSH Student] result subscription status:', status);
+      });
 
     subscriptions.push(resultChannel);
-  }
-
-  function startCountdown() {
-    screen = 'COUNTDOWN';
-    countdownNumber = 'GET READY';
-    const steps = [
-      { text: 'GET READY', delay: 800 },
-      { text: '3', delay: 800 },
-      { text: '2', delay: 800 },
-      { text: '1', delay: 800 },
-      { text: 'GO!', delay: 500 }
-    ];
-
-    let i = 0;
-    function nextStep() {
-      if (i < steps.length) {
-        countdownNumber = steps[i].text;
-        i++;
-        setTimeout(nextStep, steps[i - 1].delay);
-      } else {
-        countdownNumber = null;
-        refreshGameState().then(async (game) => {
-          if (game && game.status === 'PLAYING') {
-            screen = 'PLAYING';
-            await loadCurrentQuestion();
-          } else if (game && (game.status === 'COUNTDOWN' || game.status === 'LOBBY_CLOSED')) {
-            await handleCountdownState();
-          } else if (game) {
-            screen = 'PLAYING';
-            await loadCurrentQuestion();
-          }
-        });
-      }
-    }
-    nextStep();
   }
 
   function cleanupSubscriptions() {
@@ -496,11 +571,19 @@
 
   function handleOnline() {
     isOnline = true;
-    checkSession();
+    console.log('[WORD RUSH Student] back online, syncing game state');
+    syncGameState();
   }
 
   function handleOffline() {
     isOnline = false;
+  }
+
+  function handleVisibilityChange() {
+    if (document.visibilityState === 'visible') {
+      console.log('[WORD RUSH Student] page visible, syncing game state');
+      syncGameState();
+    }
   }
 
   $effect(() => {
@@ -510,12 +593,14 @@
 
     window.addEventListener('online', handleOnline);
     window.addEventListener('offline', handleOffline);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
 
     return () => {
       window.removeEventListener('online', handleOnline);
       window.removeEventListener('offline', handleOffline);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
       cleanupSubscriptions();
-      if (timerInterval) clearInterval(timerInterval);
+      clearAllTimers();
     };
   });
 
@@ -636,7 +721,8 @@
 
 {:else if screen === 'COUNTDOWN'}
   <div class="min-h-screen flex items-center justify-center p-4">
-    <div class="text-center animate-fade-in">
+    <div class="text-center animate-fade-in space-y-6">
+      <h1 class="text-4xl font-bold tracking-tight text-purple-700">WORD RUSH</h1>
       <div class="text-9xl font-black text-purple-600 animate-countdown select-none">
         {countdownNumber}
       </div>
