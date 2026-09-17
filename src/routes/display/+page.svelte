@@ -332,7 +332,8 @@
 
   async function generateQR() {
     try {
-      joinUrl = window.location.origin;
+      if (!currentGame) return;
+      joinUrl = `${window.location.origin}/game${currentGame.game_number}`;
       qrDataUrl = await QRCode.toDataURL(joinUrl, {
         width: 500,
         margin: 2,
