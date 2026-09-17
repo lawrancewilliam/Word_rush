@@ -5,6 +5,7 @@
 
   const supabase = getSupabase();
   const COUNTDOWN_SECONDS = 5;
+  const REVEAL_SECONDS = 3;
 
   let screen = $state('LOADING');
   let loading = $state(true);
@@ -49,6 +50,9 @@
   let questionLoadSeq = 0;
 
   let subscriptions = $state([]);
+
+  let autoAdvanceTimer = null;
+  let autoAdvancing = $state(false);
 
   function getOrCreateSession() {
     let stored = localStorage.getItem('wr_session');
@@ -104,14 +108,17 @@
   function mapStatusToScreen(game) {
     if (game.status === 'LOBBY_OPEN') {
       clearAllTimers();
+      clearAutoAdvance();
       screen = 'LOBBY';
       loadPlayers(game.id);
     } else if (game.status === 'LOBBY_CLOSED') {
       clearAllTimers();
+      clearAutoAdvance();
       screen = 'LOBBY';
       loadPlayers(game.id);
     } else if (game.status === 'COUNTDOWN') {
       clearAllTimers();
+      clearAutoAdvance();
       if (game.started_at) {
         const now = Date.now() - serverTimeOffset;
         const startedAtMs = new Date(game.started_at).getTime();
@@ -130,16 +137,26 @@
         countdownNumber = 'GET READY';
         startLocalFallbackCountdown();
       }
-    } else if (game.status === 'PLAYING' || game.status === 'QUESTION_LOCKED') {
+    } else if (game.status === 'PLAYING') {
       clearAllTimers();
+      clearAutoAdvance();
       screen = 'PLAYING';
       loadCurrentQuestion();
+    } else if (game.status === 'QUESTION_LOCKED') {
+      clearAllTimers();
+      if (screen !== 'QUESTION_RESULT') {
+        screen = 'PLAYING';
+        loadCurrentQuestion();
+      }
+      scheduleAutoAdvance();
     } else if (game.status === 'PAUSED') {
       clearAllTimers();
-      screen = 'PLAYING';
+      clearAutoAdvance();
+      screen = 'PAUSED';
       loadCurrentQuestion();
     } else if (game.status === 'COMPLETED') {
       clearAllTimers();
+      clearAutoAdvance();
       screen = 'GAME_COMPLETED';
     } else {
       screen = 'WAITING';
@@ -233,40 +250,30 @@
   async function loadCurrentQuestion() {
     if (!currentGame?.id) return;
     const seq = ++questionLoadSeq;
-    const { data: game, error: fetchError } = await supabase
-      .from('games')
-      .select('current_question_number, current_question_id, question_deadline, question_started_at, total_questions, status')
-      .eq('id', currentGame.id)
-      .single();
 
-    if (fetchError || !game) return;
+    const { data, error: rpcError } = await supabase.rpc('get_active_question', {
+      p_game_id: currentGame.id
+    });
+
+    if (rpcError || !data?.success) {
+      console.error('[WORD RUSH Student] get_active_question failed:', rpcError || data?.error);
+      return;
+    }
 
     if (seq !== questionLoadSeq) {
       console.log('[WORD RUSH Student] loadCurrentQuestion: stale response, discarding');
       return;
     }
 
-    console.log('[WORD RUSH Student] loadCurrentQuestion:', game.current_question_number, 'status:', game.status);
+    console.log('[WORD RUSH Student] loadCurrentQuestion:', data.question_number, 'status:', data.status);
 
-    questionNumber = game.current_question_number;
-    totalQuestions = game.total_questions;
-    questionDeadline = game.question_deadline;
-
-    if (game.current_question_id) {
-      const { data: q } = await supabase
-        .from('questions')
-        .select('jumbled_word, hint')
-        .eq('id', game.current_question_id)
-        .single();
-
-      if (q) {
-        jumbledWord = q.jumbled_word;
-        hint = '';
-        wrongAnswer = false;
-        showWrongMessage = false;
-        console.log('[WORD RUSH Student] question loaded:', q.jumbled_word);
-      }
-    }
+    questionNumber = data.question_number;
+    totalQuestions = data.total_questions;
+    questionDeadline = data.question_deadline;
+    jumbledWord = data.jumbled_word;
+    hint = '';
+    wrongAnswer = false;
+    showWrongMessage = false;
 
     const { data: playerData } = await supabase
       .from('players')
@@ -278,7 +285,11 @@
       hintsUsed = playerData.hints_used || 0;
     }
 
-    startTimer();
+    if (data.status === 'PLAYING') {
+      startTimer();
+    } else if (data.status === 'QUESTION_LOCKED') {
+      timeRemaining = 0;
+    }
   }
 
   function startTimer() {
@@ -293,9 +304,96 @@
 
       if (remaining <= 0) {
         clearInterval(timerInterval);
+        timerInterval = null;
         timeRemaining = 0;
+        handleTimerExpired();
       }
     }, 100);
+  }
+
+  async function handleTimerExpired() {
+    if (!currentGame?.id) return;
+
+    try {
+      const { data } = await supabase.rpc('lock_expired_question', {
+        p_game_id: currentGame.id
+      });
+
+      if (data?.success) {
+        await loadQuestionResult();
+        screen = 'QUESTION_RESULT';
+      }
+    } catch (e) {
+      console.error('[WORD RUSH Student] lock_expired_question failed:', e);
+    }
+  }
+
+  async function loadQuestionResult() {
+    if (!currentGame?.id || !currentGame.current_question_id) return;
+
+    const { data: result } = await supabase
+      .from('question_results')
+      .select('winner_player_id, result_type')
+      .eq('game_id', currentGame.id)
+      .eq('question_id', currentGame.current_question_id)
+      .maybeSingle();
+
+    if (result) {
+      if (result.result_type === 'NORMAL' && result.winner_player_id) {
+        questionWinner = result.winner_player_id;
+        isTimedOut = false;
+        const { data: winnerPlayer } = await supabase
+          .from('players')
+          .select('name')
+          .eq('id', result.winner_player_id)
+          .single();
+        if (winnerPlayer) winnerName = winnerPlayer.name;
+      } else if (result.result_type === 'TIMEOUT') {
+        isTimedOut = true;
+        questionWinner = null;
+        winnerName = '';
+      }
+    } else {
+      isTimedOut = true;
+      questionWinner = null;
+      winnerName = '';
+    }
+
+    const { data: q } = await supabase
+      .from('questions')
+      .select('correct_word')
+      .eq('id', currentGame.current_question_id)
+      .single();
+
+    if (q) correctAnswer = q.correct_word;
+  }
+
+  function scheduleAutoAdvance() {
+    clearAutoAdvance();
+    autoAdvancing = true;
+    autoAdvanceTimer = setTimeout(async () => {
+      if (!currentGame?.id) return;
+      try {
+        const { data } = await supabase.rpc('advance_question', {
+          p_game_id: currentGame.id
+        });
+        if (data?.success) {
+          await syncGameState();
+        }
+      } catch (e) {
+        console.error('[WORD RUSH Student] auto-advance failed:', e);
+      } finally {
+        autoAdvancing = false;
+      }
+    }, REVEAL_SECONDS * 1000);
+  }
+
+  function clearAutoAdvance() {
+    if (autoAdvanceTimer) {
+      clearTimeout(autoAdvanceTimer);
+      autoAdvanceTimer = null;
+    }
+    autoAdvancing = false;
   }
 
   function startSyncedCountdown(startedAt) {
@@ -444,12 +542,21 @@
       if (rpcError) throw rpcError;
 
       if (data?.error) {
-        if (data.message === 'Incorrect answer') {
+        if (data.error === 'QUESTION_LOCKED') {
+          answerInput = '';
+          await loadQuestionResult();
+          screen = 'QUESTION_RESULT';
+        } else if (data.message === 'Incorrect answer') {
           wrongAnswer = true;
           showWrongMessage = true;
           setTimeout(() => { showWrongMessage = false; }, 2000);
         }
       } else {
+        if (data?.won) {
+          correctAnswer = '';
+          await loadQuestionResult();
+          screen = 'QUESTION_RESULT';
+        }
         answerInput = '';
       }
     } catch (e) {
@@ -471,7 +578,7 @@
 
       if (rpcError) throw rpcError;
 
-      if (data?.hint) {
+      if (data?.success && data?.hint) {
         hint = data.hint;
         hintsUsed = (hintsUsed || 0) + 1;
       }
@@ -523,13 +630,14 @@
     const resultChannel = supabase
       .channel(`student-results-${gameId}`)
       .on('postgres_changes', {
-        event: 'UPDATE',
+        event: 'INSERT',
         schema: 'public',
         table: 'question_results',
         filter: `game_id=eq.${gameId}`
       }, async (payload) => {
         const r = payload.new;
         console.log('[WORD RUSH Student] result event:', r.result_type);
+
         if (r.result_type === 'NORMAL' && r.winner_player_id) {
           questionWinner = r.winner_player_id;
           isTimedOut = false;
@@ -539,17 +647,30 @@
             .select('name')
             .eq('id', r.winner_player_id)
             .single();
-          if (winnerPlayer) {
-            winnerName = winnerPlayer.name;
-          }
+          if (winnerPlayer) winnerName = winnerPlayer.name;
+
+          const { data: q } = await supabase
+            .from('questions')
+            .select('correct_word')
+            .eq('id', currentGame?.current_question_id)
+            .single();
+          if (q) correctAnswer = q.correct_word;
+
           if (screen === 'PLAYING') {
             screen = 'QUESTION_RESULT';
           }
         } else if (r.result_type === 'TIMEOUT') {
           isTimedOut = true;
-          correctAnswer = '';
           winnerName = '';
           questionWinner = null;
+
+          const { data: q } = await supabase
+            .from('questions')
+            .select('correct_word')
+            .eq('id', currentGame?.current_question_id)
+            .single();
+          if (q) correctAnswer = q.correct_word;
+
           if (screen === 'PLAYING') {
             screen = 'QUESTION_RESULT';
           }
@@ -601,6 +722,7 @@
       document.removeEventListener('visibilitychange', handleVisibilityChange);
       cleanupSubscriptions();
       clearAllTimers();
+      clearAutoAdvance();
     };
   });
 
@@ -813,6 +935,17 @@
     </div>
   </div>
 
+{:else if screen === 'PAUSED'}
+  <div class="min-h-screen flex items-center justify-center p-4">
+    <div class="w-full max-w-md animate-scale-in text-center space-y-6">
+      <div class="glass-strong rounded-2xl p-8 space-y-4">
+        <div class="text-5xl mb-4">&#x23F8;</div>
+        <h2 class="text-2xl font-bold text-gray-900">Game Paused</h2>
+        <p class="text-gray-500">Waiting for the host to resume...</p>
+      </div>
+    </div>
+  </div>
+
 {:else if screen === 'QUESTION_RESULT'}
   <div class="min-h-screen flex items-center justify-center p-4">
     <div class="w-full max-w-md animate-scale-in text-center space-y-6">
@@ -836,7 +969,13 @@
         {/if}
       </div>
 
-      <p class="text-gray-400 text-sm animate-pulse">Waiting for next question...</p>
+      <p class="text-gray-400 text-sm animate-pulse">
+        {#if autoAdvancing}
+          Next question in {REVEAL_SECONDS}s...
+        {:else}
+          Waiting for next question...
+        {/if}
+      </p>
     </div>
   </div>
 

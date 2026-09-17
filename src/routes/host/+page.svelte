@@ -481,9 +481,18 @@
     if (!selectedGameId || isProcessing) return;
     isProcessing = true;
     try {
+      const now = getServerNow();
+      const deadline = selectedGame?.question_deadline
+        ? new Date(selectedGame.question_deadline).getTime()
+        : 0;
+      const remainingMs = Math.max(0, deadline - now);
+
       const { error } = await supabase
         .from('games')
-        .update({ status: 'PAUSED' })
+        .update({
+          status: 'PAUSED',
+          paused_remaining_ms: Math.round(remainingMs)
+        })
         .eq('id', selectedGameId);
 
       if (!error) {
@@ -501,9 +510,16 @@
     if (!selectedGameId || isProcessing) return;
     isProcessing = true;
     try {
+      const remainingMs = selectedGame?.paused_remaining_ms || 30000;
+      const newDeadline = new Date(Date.now() + remainingMs).toISOString();
+
       const { error } = await supabase
         .from('games')
-        .update({ status: 'PLAYING' })
+        .update({
+          status: 'PLAYING',
+          question_deadline: newDeadline,
+          paused_remaining_ms: null
+        })
         .eq('id', selectedGameId);
 
       if (!error) {
@@ -536,7 +552,15 @@
         console.warn('Skip insert warning:', insertError);
       }
 
-      await advanceToNextQuestion();
+      const { data, error } = await supabase.rpc('advance_question', {
+        p_game_id: selectedGameId
+      });
+
+      if (error) throw error;
+
+      if (data?.success) {
+        await refreshSelectedGame();
+      }
     } catch (e) {
       console.error('Skip question failed:', e);
     } finally {
@@ -570,46 +594,19 @@
         }
       }
 
-      await advanceToNextQuestion();
+      const { data, error } = await supabase.rpc('advance_question', {
+        p_game_id: selectedGameId
+      });
+
+      if (error) throw error;
+
+      if (data?.success) {
+        await refreshSelectedGame();
+      }
     } catch (e) {
       console.error('Next question failed:', e);
     } finally {
       isProcessing = false;
-    }
-  }
-
-  async function advanceToNextQuestion() {
-    const currentQNum = selectedGame?.current_question_number || 0;
-    const nextQNum = currentQNum + 1;
-    const totalQ = selectedGame?.total_questions || 20;
-
-    if (nextQNum > totalQ) {
-      await finalizeGame();
-      return;
-    }
-
-    const gameQuestions = questions[selectedGame?.game_number] || [];
-    const nextQuestion = gameQuestions.find(q => q.question_order === nextQNum);
-
-    if (!nextQuestion) {
-      await finalizeGame();
-      return;
-    }
-
-    const { error } = await supabase
-      .from('games')
-      .update({
-        status: 'PLAYING',
-        current_question_number: nextQNum,
-        current_question_id: nextQuestion.id,
-        question_started_at: new Date().toISOString(),
-        question_deadline: new Date(Date.now() + 30000).toISOString(),
-        projector_mode: 'QUESTION'
-      })
-      .eq('id', selectedGameId);
-
-    if (!error) {
-      await refreshSelectedGame();
     }
   }
 
