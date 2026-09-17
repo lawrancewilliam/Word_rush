@@ -270,6 +270,7 @@
     if (game) {
       loadPlayersForGame(gameId);
       loadLeaderboard(gameId);
+      loadAllQuestions();
       startTimerForGame(game);
       if (game.status === 'LOBBY_OPEN') {
         generateQR();
@@ -451,20 +452,21 @@
           countdownInterval = null;
           countdownTimer = null;
 
-          const firstQuestion = questions[selectedGame?.game_number]?.[0];
+          const { data, error } = await supabase.rpc('start_game', {
+            p_game_id: selectedGameId
+          });
 
-          await supabase
-            .from('games')
-            .update({
-              status: 'PLAYING',
-              current_question_number: 1,
-              current_question_id: firstQuestion?.id || null,
-              question_started_at: new Date().toISOString(),
-              question_deadline: new Date(Date.now() + 30000).toISOString(),
-              projector_mode: 'QUESTION'
-            })
-            .eq('id', selectedGameId);
+          if (error) {
+            console.error('[WORD RUSH] start_game RPC failed:', error);
+            return;
+          }
 
+          if (!data?.success) {
+            console.error('[WORD RUSH] start_game returned error:', data?.error);
+            return;
+          }
+
+          console.log('[WORD RUSH] start_game success:', data);
           await refreshSelectedGame();
         }
       }, 1000);

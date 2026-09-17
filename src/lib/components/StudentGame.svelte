@@ -96,7 +96,13 @@
         return;
       }
 
-      console.log('[WORD RUSH Student] syncGameState: status =', game.status, 'screen before =', screen);
+      console.log('[WORD RUSH Student] GAME STATE:',
+        'status =', game.status,
+        '| question_number =', game.current_question_number,
+        '| question_id =', game.current_question_id ? 'present' : 'NULL',
+        '| deadline =', game.question_deadline,
+        '| screen before =', screen);
+
       currentGame = game;
       mapStatusToScreen(game);
       console.log('[WORD RUSH Student] syncGameState: screen after =', screen);
@@ -251,26 +257,103 @@
     if (!currentGame?.id) return;
     const seq = ++questionLoadSeq;
 
+    console.log('[WORD RUSH Student] loadCurrentQuestion: game status =', currentGame.status,
+      'question_number =', currentGame.current_question_number,
+      'question_id =', currentGame.current_question_id);
+
+    // Validate game state - if question_number is 0 or question_id is null while PLAYING, re-sync
+    if (currentGame.status === 'PLAYING' && (!currentGame.current_question_number || currentGame.current_question_number < 1 || !currentGame.current_question_id)) {
+      console.warn('[WORD RUSH Student] INVALID STATE: PLAYING with question_number =', currentGame.current_question_number, 'question_id =', currentGame.current_question_id, '- re-syncing');
+      setTimeout(() => syncGameState(), 1000);
+      return;
+    }
+
+    // Try RPC first (migration 005/006)
     const { data, error: rpcError } = await supabase.rpc('get_active_question', {
       p_game_id: currentGame.id
     });
 
-    if (rpcError || !data?.success) {
-      console.error('[WORD RUSH Student] get_active_question failed:', rpcError || data?.error);
+    if (!rpcError && data?.success) {
+      if (seq !== questionLoadSeq) {
+        console.log('[WORD RUSH Student] loadCurrentQuestion: stale response, discarding');
+        return;
+      }
+
+      console.log('[WORD RUSH Student] RPC success: question', data.question_number, 'jumbled:', data.jumbled_word ? data.jumbled_word.substring(0, 8) + '...' : 'MISSING');
+
+      questionNumber = data.question_number;
+      totalQuestions = data.total_questions;
+      questionDeadline = data.question_deadline;
+      jumbledWord = data.jumbled_word;
+      hint = '';
+      wrongAnswer = false;
+      showWrongMessage = false;
+
+      const { data: playerData } = await supabase
+        .from('players')
+        .select('hints_used')
+        .eq('id', playerId)
+        .single();
+
+      if (playerData) {
+        hintsUsed = playerData.hints_used || 0;
+      }
+
+      if (data.status === 'PLAYING') {
+        startTimer();
+      } else if (data.status === 'QUESTION_LOCKED') {
+        timeRemaining = 0;
+      }
+      return;
+    }
+
+    // Fallback: direct table query (works before migration 005/006 is applied)
+    console.warn('[WORD RUSH Student] get_active_question RPC failed, using direct query fallback. Error:', rpcError?.message || data?.error);
+
+    const { data: gameData, error: gameErr } = await supabase
+      .from('games')
+      .select('current_question_number, current_question_id, question_deadline, question_started_at, total_questions, status')
+      .eq('id', currentGame.id)
+      .single();
+
+    if (gameErr || !gameData) {
+      console.error('[WORD RUSH Student] Fallback game query failed:', gameErr);
       return;
     }
 
     if (seq !== questionLoadSeq) {
-      console.log('[WORD RUSH Student] loadCurrentQuestion: stale response, discarding');
+      console.log('[WORD RUSH Student] loadCurrentQuestion fallback: stale response, discarding');
       return;
     }
 
-    console.log('[WORD RUSH Student] loadCurrentQuestion:', data.question_number, 'status:', data.status);
+    console.log('[WORD RUSH Student] Fallback game data: question', gameData.current_question_number, 'id:', gameData.current_question_id ? 'present' : 'NULL');
 
-    questionNumber = data.question_number;
-    totalQuestions = data.total_questions;
-    questionDeadline = data.question_deadline;
-    jumbledWord = data.jumbled_word;
+    // Validate: if question_id is null, re-sync
+    if (!gameData.current_question_id || !gameData.current_question_number || gameData.current_question_number < 1) {
+      console.warn('[WORD RUSH Student] INVALID STATE from DB: question_number =', gameData.current_question_number, 'question_id =', gameData.current_question_id, '- will retry');
+      setTimeout(() => syncGameState(), 1500);
+      return;
+    }
+
+    questionNumber = gameData.current_question_number;
+    totalQuestions = gameData.total_questions;
+    questionDeadline = gameData.question_deadline;
+
+    // Fetch question data directly
+    const { data: q, error: qErr } = await supabase
+      .from('questions')
+      .select('jumbled_word, hint')
+      .eq('id', gameData.current_question_id)
+      .single();
+
+    if (qErr || !q) {
+      console.error('[WORD RUSH Student] Fallback question query failed:', qErr);
+      return;
+    }
+
+    console.log('[WORD RUSH Student] Fallback question loaded:', q.jumbled_word ? q.jumbled_word.substring(0, 8) + '...' : 'MISSING');
+
+    jumbledWord = q.jumbled_word;
     hint = '';
     wrongAnswer = false;
     showWrongMessage = false;
@@ -285,9 +368,9 @@
       hintsUsed = playerData.hints_used || 0;
     }
 
-    if (data.status === 'PLAYING') {
+    if (gameData.status === 'PLAYING') {
       startTimer();
-    } else if (data.status === 'QUESTION_LOCKED') {
+    } else if (gameData.status === 'QUESTION_LOCKED') {
       timeRemaining = 0;
     }
   }
@@ -860,78 +943,85 @@
     </div>
 
     <div class="flex-1 flex flex-col items-center justify-center gap-6">
-      <div class="glass-strong rounded-2xl p-6 w-full text-center">
-        <p class="text-xs text-gray-400 uppercase tracking-widest mb-4">Unscramble this word</p>
-        <div class="text-3xl sm:text-4xl font-black tracking-widest text-gray-900 select-none py-4">
-          {jumbledWord}
+      {#if !jumbledWord}
+        <div class="glass-strong rounded-2xl p-6 w-full text-center">
+          <div class="inline-block w-8 h-8 border-4 border-purple-500 border-t-transparent rounded-full animate-spin mb-3"></div>
+          <p class="text-gray-500 text-sm">Loading question...</p>
         </div>
-      </div>
-
-      {#if hint}
-        <div class="w-full glass rounded-xl px-4 py-3 border border-amber-200 bg-amber-50">
-          <p class="text-xs text-amber-600 uppercase tracking-wider mb-1">Hint</p>
-          <p class="text-sm text-amber-700">{hint}</p>
+      {:else}
+        <div class="glass-strong rounded-2xl p-6 w-full text-center">
+          <p class="text-xs text-gray-400 uppercase tracking-widest mb-4">Unscramble this word</p>
+          <div class="text-3xl sm:text-4xl font-black tracking-widest text-gray-900 select-none py-4">
+            {jumbledWord}
+          </div>
         </div>
-      {/if}
 
-      <div class="w-full glass rounded-2xl p-5 space-y-4">
-        <div class="flex items-center justify-between">
-          <div class="flex items-center gap-2">
-            <div class="text-2xl font-mono font-bold {timeRemaining <= 10 ? 'text-red-500 animate-pulse' : 'text-gray-900'}">
-              {formatTime(timeRemaining)}
+        {#if hint}
+          <div class="w-full glass rounded-xl px-4 py-3 border border-amber-200 bg-amber-50">
+            <p class="text-xs text-amber-600 uppercase tracking-wider mb-1">Hint</p>
+            <p class="text-sm text-amber-700">{hint}</p>
+          </div>
+        {/if}
+
+        <div class="w-full glass rounded-2xl p-5 space-y-4">
+          <div class="flex items-center justify-between">
+            <div class="flex items-center gap-2">
+              <div class="text-2xl font-mono font-bold {timeRemaining <= 10 ? 'text-red-500 animate-pulse' : 'text-gray-900'}">
+                {formatTime(timeRemaining)}
+              </div>
+            </div>
+            <div class="text-xs text-gray-400">
+              Hints Left: {maxHints - hintsUsed}
             </div>
           </div>
-          <div class="text-xs text-gray-400">
-            Hints Left: {maxHints - hintsUsed}
+
+          <div class="relative">
+            <input
+              type="text"
+              bind:value={answerInput}
+              onkeydown={handleAnswerKeydown}
+              placeholder="Type your answer..."
+              disabled={submittingAnswer || timeRemaining <= 0}
+              autocomplete="off"
+              autocapitalize="off"
+              autocorrect="off"
+              spellcheck="false"
+              class="w-full px-5 py-4 rounded-xl bg-white border-2 {wrongAnswer ? 'border-red-400' : 'border-gray-200 focus:border-purple-500'} text-gray-900 text-xl text-center tracking-wide placeholder-gray-300 transition-all outline-none"
+            />
           </div>
+
+          {#if showWrongMessage}
+            <p class="text-center text-red-500 text-sm font-medium animate-fade-in">
+              Wrong Answer - Try Again!
+            </p>
+          {/if}
+
+          <div class="flex gap-3">
+            <button
+              onclick={requestHint}
+              disabled={hintsUsed >= maxHints || timeRemaining <= 0}
+              class="flex-shrink-0 px-4 py-3 rounded-xl bg-gray-100 border border-gray-200 text-gray-600 disabled:text-gray-300 disabled:border-gray-100 text-sm font-medium transition-all active:scale-[0.98]"
+            >
+              Get Hint
+            </button>
+            <button
+              onclick={submitAnswer}
+              disabled={submittingAnswer || !answerInput.trim() || timeRemaining <= 0}
+              class="flex-1 py-3 rounded-xl bg-purple-600 hover:bg-purple-700 disabled:bg-gray-200 disabled:text-gray-400 text-white font-semibold text-lg transition-all active:scale-[0.98] shadow-lg shadow-purple-600/25"
+            >
+              {#if submittingAnswer}
+                <span class="inline-block w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin"></span>
+              {:else}
+                SUBMIT
+              {/if}
+            </button>
+          </div>
+
+          {#if timeRemaining <= 0}
+            <p class="text-center text-red-500 font-bold text-lg animate-fade-in">TIME'S UP!</p>
+          {/if}
         </div>
-
-        <div class="relative">
-          <input
-            type="text"
-            bind:value={answerInput}
-            onkeydown={handleAnswerKeydown}
-            placeholder="Type your answer..."
-            disabled={submittingAnswer || timeRemaining <= 0}
-            autocomplete="off"
-            autocapitalize="off"
-            autocorrect="off"
-            spellcheck="false"
-            class="w-full px-5 py-4 rounded-xl bg-white border-2 {wrongAnswer ? 'border-red-400' : 'border-gray-200 focus:border-purple-500'} text-gray-900 text-xl text-center tracking-wide placeholder-gray-300 transition-all outline-none"
-          />
-        </div>
-
-        {#if showWrongMessage}
-          <p class="text-center text-red-500 text-sm font-medium animate-fade-in">
-            Wrong Answer - Try Again!
-          </p>
-        {/if}
-
-        <div class="flex gap-3">
-          <button
-            onclick={requestHint}
-            disabled={hintsUsed >= maxHints || timeRemaining <= 0}
-            class="flex-shrink-0 px-4 py-3 rounded-xl bg-gray-100 border border-gray-200 text-gray-600 disabled:text-gray-300 disabled:border-gray-100 text-sm font-medium transition-all active:scale-[0.98]"
-          >
-            Get Hint
-          </button>
-          <button
-            onclick={submitAnswer}
-            disabled={submittingAnswer || !answerInput.trim() || timeRemaining <= 0}
-            class="flex-1 py-3 rounded-xl bg-purple-600 hover:bg-purple-700 disabled:bg-gray-200 disabled:text-gray-400 text-white font-semibold text-lg transition-all active:scale-[0.98] shadow-lg shadow-purple-600/25"
-          >
-            {#if submittingAnswer}
-              <span class="inline-block w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin"></span>
-            {:else}
-              SUBMIT
-            {/if}
-          </button>
-        </div>
-
-        {#if timeRemaining <= 0}
-          <p class="text-center text-red-500 font-bold text-lg animate-fade-in">TIME'S UP!</p>
-        {/if}
-      </div>
+      {/if}
     </div>
   </div>
 
