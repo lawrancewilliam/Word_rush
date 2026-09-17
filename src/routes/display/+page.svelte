@@ -392,13 +392,6 @@
         <h1 class="text-5xl md:text-7xl font-black tracking-tight text-purple-700">
           WORD RUSH
         </h1>
-        {#if currentGame?.game_number}
-          <div class="inline-block mt-4 px-6 py-2 rounded-full bg-purple-50 border border-purple-200">
-            <span class="text-lg md:text-xl font-bold text-purple-700 tracking-[0.3em]">
-              GAME {currentGame.game_number}
-            </span>
-          </div>
-        {/if}
       </div>
 
       <div class="flex flex-col items-center gap-6">
@@ -459,11 +452,6 @@
         <h1 class="text-4xl md:text-5xl font-black tracking-tight text-gray-900">
           WORD RUSH
         </h1>
-        {#if currentGame?.game_number}
-          <span class="inline-block px-4 py-1 rounded-full bg-purple-50 border border-purple-200 text-sm md:text-base font-semibold text-purple-700 tracking-[0.3em]">
-            GAME {currentGame.game_number}
-          </span>
-        {/if}
       </div>
 
       <div class="text-lg md:text-xl text-gray-400 tracking-[0.3em] uppercase">
@@ -541,11 +529,6 @@
         <h1 class="text-5xl md:text-7xl font-black tracking-tight text-purple-700">
           CURRENT STANDINGS
         </h1>
-        {#if currentGame?.game_number}
-          <span class="inline-block mt-3 px-5 py-1.5 rounded-full bg-purple-50 border border-purple-200 text-sm font-semibold text-purple-700 tracking-[0.3em]">
-            GAME {currentGame.game_number}
-          </span>
-        {/if}
       </div>
 
       <div class="space-y-2 mt-6">
@@ -581,23 +564,18 @@
         <h1 class="text-5xl md:text-7xl font-black tracking-tight text-purple-700">
           WORD RUSH
         </h1>
-        {#if currentGame?.game_number}
-          <div class="mt-4">
-            <span class="text-2xl md:text-3xl font-bold text-gray-500 tracking-[0.2em]">
-              GAME {currentGame.game_number}
-            </span>
-            <span class="text-2xl md:text-3xl font-bold text-purple-600 tracking-[0.2em] ml-3">
-              CHAMPION
-            </span>
-          </div>
-        {/if}
+        <div class="mt-4">
+          <span class="text-2xl md:text-3xl font-bold text-purple-600 tracking-[0.2em]">
+            CHAMPION
+          </span>
+        </div>
       </div>
 
       <div class="py-8">
         {#if champions.length > 0}
           <div class="space-y-3">
             <div class="inline-block px-12 py-8 rounded-3xl bg-purple-50 border-2 border-purple-200 shadow-xl">
-              <p class="text-lg text-purple-500 uppercase tracking-[0.3em] mb-2">Game {champions[0].gameNumber} Champion</p>
+              <p class="text-lg text-purple-500 uppercase tracking-[0.3em] mb-2">Champion</p>
               <div class="text-6xl md:text-8xl font-black text-gray-900 tracking-wide">
                 {champions[0].name}
               </div>
@@ -618,7 +596,6 @@
               <p class="text-sm text-gray-400 uppercase tracking-[0.3em] mb-2">
                 {i === 0 ? 'Runner-up' : '2nd Runner-up'}
               </p>
-              <p class="text-lg text-gray-500 mb-1">Game {champ.gameNumber}</p>
               <p class="text-3xl md:text-4xl font-bold text-gray-900">{champ.name}</p>
               <p class="text-xl text-gray-400 mt-1">{champ.score} / {totalQuestions}</p>
             </div>
@@ -650,7 +627,7 @@
         {#each champions as champ, i}
           <div class="px-8 py-8 rounded-3xl {i === 0 ? 'bg-purple-50 border-2 border-purple-200 shadow-xl' : 'bg-gray-50 border border-gray-200'}">
             <p class="text-sm text-gray-400 uppercase tracking-[0.3em] mb-4">
-              GAME {champ.gameNumber} CHAMPION
+              CHAMPION
             </p>
             <div class="text-4xl md:text-5xl font-black text-gray-900 tracking-wide leading-tight">
               {champ.name}

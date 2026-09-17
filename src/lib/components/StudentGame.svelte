@@ -512,12 +512,9 @@
 {:else if screen === 'REGISTRATION'}
   <div class="min-h-screen flex items-center justify-center p-4">
     <div class="w-full max-w-md animate-fade-in">
-      <div class="text-center mb-8">
+        <div class="text-center mb-8">
         <h1 class="text-4xl font-bold tracking-tight text-purple-700">WORD RUSH</h1>
         <p class="text-gray-500 mt-2 text-sm tracking-wide">Unscramble. Think Fast. Win.</p>
-        <div class="inline-block mt-4 px-4 py-1.5 rounded-full bg-purple-100 border border-purple-200 text-purple-700 text-xs font-semibold tracking-wider">
-          GAME {gameNumber}
-        </div>
       </div>
 
       <div class="glass-strong rounded-2xl p-6 space-y-5">
@@ -559,9 +556,6 @@
   <div class="min-h-screen flex items-center justify-center p-4">
     <div class="w-full max-w-md animate-scale-in">
       <div class="text-center mb-6">
-        <div class="inline-block px-4 py-1.5 rounded-full bg-purple-100 border border-purple-200 text-purple-700 text-xs font-semibold tracking-wider mb-4">
-          GAME {gameNumber}
-        </div>
         <h1 class="text-3xl font-bold text-gray-900">YOU'RE IN!</h1>
       </div>
 
@@ -595,10 +589,7 @@
 
 {:else if screen === 'PLAYING'}
   <div class="min-h-screen flex flex-col p-4 max-w-lg mx-auto">
-    <div class="flex items-center justify-between mb-4">
-      <span class="text-xs font-semibold text-purple-700 bg-purple-100 px-3 py-1 rounded-full tracking-wider">
-        GAME {gameNumber}
-      </span>
+    <div class="flex items-center justify-end mb-4">
       <span class="text-xs text-gray-400">
         QUESTION {questionNumber} / {totalQuestions}
       </span>
@@ -717,7 +708,7 @@
       <div class="glass-strong rounded-2xl p-8 space-y-4">
         <div class="text-5xl mb-4">&#x1F389;</div>
         <h2 class="text-2xl font-bold text-gray-900">
-          Game {gameNumber} Completed!
+          Game Completed!
         </h2>
         <p class="text-gray-500">Thank you for playing!</p>
       </div>
@@ -734,9 +725,9 @@
       <div class="glass-strong rounded-2xl p-8 space-y-4">
         <div class="text-5xl mb-4">&#x1F512;</div>
         <h2 class="text-2xl font-bold text-gray-900">
-          Game {gameNumber} Full
+          Game Full
         </h2>
-        <p class="text-gray-500">This game has reached 20 players. Please wait for the next game.</p>
+        <p class="text-gray-500">The maximum number of players has joined. Please wait for the next round.</p>
       </div>
     </div>
   </div>
@@ -751,9 +742,9 @@
       <div class="glass-strong rounded-2xl p-8 space-y-4">
         <div class="text-5xl mb-4">&#x1F3AE;</div>
         <h2 class="text-2xl font-bold text-gray-900">
-          Game {gameNumber} In Progress
+          Game In Progress
         </h2>
-        <p class="text-gray-500">Please wait for the next game.</p>
+        <p class="text-gray-500">Please wait for the next round.</p>
       </div>
     </div>
   </div>
@@ -770,7 +761,7 @@
           <div class="w-3 h-3 rounded-full bg-purple-500 animate-pulse"></div>
         </div>
         <h2 class="text-2xl font-bold text-gray-900">
-          Game {gameNumber} Not Open Yet
+          Lobby Not Open Yet
         </h2>
         <p class="text-gray-500">Please wait for the host to open the lobby.</p>
       </div>
