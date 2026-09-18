@@ -187,7 +187,32 @@
       isTieBreaker = false;
       tieBreakerScreen = 'NONE';
 
-      if (game.tie_breaker_status === 'LOBBY_OPEN') {
+      if (game.tie_breaker_status === 'COUNTDOWN') {
+        if (checkTieBreakerKicked(game)) {
+          isKicked = true;
+          kickedReason = 'TIE_BREAKER';
+          screen = 'KICKED_OUT';
+        } else if (checkTieBreakerEligibility(game)) {
+          if (game.tie_breaker_started_at) {
+            const now = Date.now() - serverTimeOffset;
+            const end = new Date(game.tie_breaker_started_at).getTime() + COUNTDOWN_SECONDS * 1000;
+            const remaining = (end - now) / 1000;
+            if (remaining > 0.5) {
+              startTieBreakerSyncedCountdown(game.tie_breaker_started_at);
+            } else {
+              screen = 'TIE_BREAKER_COUNTDOWN';
+              countdownNumber = 'GO!';
+              setTimeout(() => syncGameState(), 500);
+            }
+          } else {
+            screen = 'TIE_BREAKER_COUNTDOWN';
+            countdownNumber = 'GET READY';
+            setTimeout(() => syncGameState(), 600);
+          }
+        } else {
+          screen = 'GAME_COMPLETED';
+        }
+      } else if (game.tie_breaker_status === 'LOBBY_OPEN') {
         if (checkTieBreakerKicked(game)) {
           isKicked = true;
           kickedReason = 'TIE_BREAKER';
@@ -749,6 +774,41 @@
     updateCountdown();
     countdownInterval = setInterval(updateCountdown, 100);
     console.log('[WORD RUSH Student] synced countdown started from:', startedAt);
+  }
+
+  function startTieBreakerSyncedCountdown(startedAt) {
+    clearAllTimers();
+    screen = 'TIE_BREAKER_COUNTDOWN';
+    countdownDeadline = new Date(startedAt).getTime() + COUNTDOWN_SECONDS * 1000;
+
+    function updateTieBreakerCountdown() {
+      const now = Date.now() - serverTimeOffset;
+      const remaining = Math.max(0, (countdownDeadline - now) / 1000);
+
+      if (remaining > 4.5) {
+        countdownNumber = 'GET READY';
+      } else if (remaining > 3.5) {
+        countdownNumber = '5';
+      } else if (remaining > 2.5) {
+        countdownNumber = '4';
+      } else if (remaining > 1.5) {
+        countdownNumber = '3';
+      } else if (remaining > 0.5) {
+        countdownNumber = '2';
+      } else if (remaining > 0) {
+        countdownNumber = '1';
+      } else {
+        countdownNumber = 'GO!';
+        clearCountdown();
+        console.log('[WORD RUSH Student] tie breaker countdown finished, syncing game state');
+        setTimeout(() => syncGameState(), 500);
+        return;
+      }
+    }
+
+    updateTieBreakerCountdown();
+    countdownInterval = setInterval(updateTieBreakerCountdown, 100);
+    console.log('[WORD RUSH Student] tie breaker synced countdown started from:', startedAt);
   }
 
   function startLocalFallbackCountdown() {
@@ -1388,9 +1448,21 @@
       <div class="glass-strong rounded-2xl p-8 space-y-4">
         <div class="text-5xl mb-4">&#x1F3C6;</div>
         <h2 class="text-2xl font-bold text-gray-900">TIE BREAKER</h2>
-        <p class="text-amber-600 font-semibold">You're qualified!</p>
+        <p class="text-amber-600 font-semibold">YOU'RE QUALIFIED!</p>
         <p class="text-gray-500 text-sm">Waiting for the host to start...</p>
       </div>
+    </div>
+  </div>
+
+{:else if screen === 'TIE_BREAKER_COUNTDOWN'}
+  <div class="min-h-screen flex items-center justify-center p-4 bg-gradient-to-br from-gray-900 via-gray-800 to-amber-900">
+    <div class="text-center animate-scale-in space-y-6">
+      <h1 class="text-4xl font-bold tracking-tight text-amber-500">WORD RUSH</h1>
+      <div class="text-9xl font-black {countdownNumber === 'GO!' ? 'text-emerald-400' : 'text-amber-400'} animate-countdown select-none">
+        {countdownNumber}
+      </div>
+      <p class="text-gray-300 text-xl tracking-widest">TIE BREAKER</p>
+      <p class="text-amber-500/80 font-semibold">YOU'RE QUALIFIED!</p>
     </div>
   </div>
 
@@ -1523,7 +1595,7 @@
       <div class="glass-strong rounded-2xl p-8 space-y-4">
         <div class="text-5xl mb-4">&#x1F6AB;</div>
         {#if kickedReason === 'TIE_BREAKER'}
-          <h2 class="text-2xl font-bold text-gray-900">Removed from Tie Breaker</h2>
+          <h2 class="text-2xl font-bold text-gray-900">YOU'VE BEEN REMOVED FROM THE TIE BREAKER</h2>
           <p class="text-gray-500">The host has removed you from the tie breaker.</p>
         {:else}
           <h2 class="text-2xl font-bold text-gray-900">You've Been Removed</h2>

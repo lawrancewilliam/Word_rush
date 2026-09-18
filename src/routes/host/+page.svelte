@@ -31,6 +31,7 @@
 
   let subscriptions = $state([]);
   let activeTab = $state('GAME 1');
+  let dashboardMode = $state('game');
   let showConfirmDialog = $state(false);
   let confirmAction = $state(null);
   let confirmMessage = $state('');
@@ -59,10 +60,12 @@
   let activePlayerCount = $derived(activePlayers.length);
 
   let isTieBreakerLobby = $derived(selectedGame?.tie_breaker_status === 'LOBBY_OPEN');
+  let isTieBreakerCountdown = $derived(selectedGame?.tie_breaker_status === 'COUNTDOWN');
   let isTieBreakerActive = $derived(selectedGame?.tie_breaker_status === 'ACTIVE');
   let isTieBreakerCompleted = $derived(selectedGame?.tie_breaker_status === 'COMPLETED');
   let isTieBreakerUnresolved = $derived(selectedGame?.tie_breaker_status === 'UNRESOLVED');
-  let hasTie = $derived(() => {
+  let isTieBreakerMode = $derived(dashboardMode === 'tiebreaker');
+  let hasTie = $derived.by(() => {
     if (!selectedGame || selectedGame.status !== 'COMPLETED') return false;
     if (selectedGame.tie_breaker_status !== 'NONE') return false;
     const topScore = Math.max(...players.filter(p => p.game_id === selectedGameId && p.is_active).map(p => p.score), 0);
@@ -72,6 +75,34 @@
   let eligibleTBPlayers = $derived(
     (selectedGame?.tie_breaker_participants || []).filter(p => !p.is_kicked)
   );
+
+  function getTieBreakerStatusFor(game) {
+    if (!game) return 'NOT REQUIRED';
+    if (game.tie_breaker_status === 'COMPLETED' || game.tie_breaker_status === 'UNRESOLVED') return 'COMPLETED';
+    if (game.tie_breaker_status === 'ACTIVE') return 'PLAYING';
+    if (game.tie_breaker_status === 'COUNTDOWN') return 'COUNTDOWN';
+    if (game.tie_breaker_status === 'LOBBY_OPEN') return 'READY';
+    if (game.status === 'COMPLETED') {
+      const active = players.filter(p => p.game_id === game.id && p.is_active);
+      const topScore = Math.max(0, ...active.map(p => p.score));
+      const tiedCount = active.filter(p => p.score === topScore).length;
+      return tiedCount >= 2 && topScore > 0 ? 'TIE DETECTED' : 'NOT REQUIRED';
+    }
+    return 'NOT REQUIRED';
+  }
+
+  function getTieBreakerColor(status) {
+    const colors = {
+      'NOT REQUIRED': 'bg-gray-100 text-gray-500',
+      'TIE DETECTED': 'bg-amber-50 text-amber-700 border border-amber-200',
+      'LOBBY OPEN': 'bg-amber-50 text-amber-700 border border-amber-200',
+      'READY': 'bg-green-50 text-green-700 border border-green-200',
+      'COUNTDOWN': 'bg-orange-50 text-orange-700 border border-orange-200',
+      'PLAYING': 'bg-purple-50 text-purple-700 border border-purple-200',
+      'COMPLETED': 'bg-gray-50 text-gray-500 border border-gray-200'
+    };
+    return colors[status] || 'bg-gray-100 text-gray-500';
+  }
 
   function getStatusColor(status) {
     const colors = {
@@ -293,6 +324,7 @@
   }
 
   function selectGame(gameId) {
+    dashboardMode = 'game';
     selectedGameId = gameId;
     const game = games.find(g => g.id === gameId);
     if (game) {
@@ -305,6 +337,29 @@
       } else {
         qrDataUrl = '';
         joinUrl = '';
+      }
+    }
+  }
+
+  function selectTieBreaker() {
+    dashboardMode = 'tiebreaker';
+    const stateGame = games.find(g => g.tie_breaker_status && g.tie_breaker_status !== 'NONE') || selectedGame;
+    selectedGameId = stateGame?.id || selectedGameId;
+    if (selectedGameId) {
+      loadPlayersForGame(selectedGameId);
+      loadLeaderboard(selectedGameId);
+      loadAllQuestions();
+      const g = games.find(x => x.id === selectedGameId);
+      if (g) {
+        startTimerForGame(g);
+        if (g.tie_breaker_status === 'ACTIVE' && g.tie_breaker_deadline) {
+          startTieBreakerTimer();
+        }
+        if (!g.tie_breaker_status || g.tie_breaker_status === 'NONE') {
+          if (g.status === 'COMPLETED' && getTieBreakerStatusFor(g) === 'TIE DETECTED') {
+            openTieBreakerLobby();
+          }
+        }
       }
     }
   }
@@ -701,8 +756,8 @@
     });
   }
 
-  async function removePlayer(playerId) {
-    showConfirm('Remove this player from the game?', async () => {
+  async function removePlayer(playerId, playerName = '') {
+    showConfirm(`Remove ${playerName || 'this player'} from this lobby?`, async () => {
       try {
         const { data, error } = await supabase.rpc('remove_player', {
           p_player_id: playerId
@@ -797,7 +852,7 @@
     }
   }
 
-  async function startTieBreaker() {
+async function startTieBreaker() {
     if (!selectedGameId || isProcessing) return;
     isProcessing = true;
     try {
@@ -813,7 +868,12 @@
           if (tieBreakerCountdown <= 0) {
             clearInterval(tieBreakerCountdownInterval);
             tieBreakerCountdownInterval = null;
-            tieBreakerCountdown = null;
+            const { data: startData, error: startErr } = await supabase.rpc('start_tiebreaker_questions', {
+              p_game_id: selectedGameId
+            });
+            if (startErr || !startData?.success) {
+              console.error('Start tie-breaker questions failed:', startErr || startData);
+            }
             await refreshSelectedGame();
           }
         }, 1000);
@@ -823,6 +883,31 @@
     } finally {
       isProcessing = false;
     }
+  }
+
+  function resetTieBreaker() {
+    showConfirm('Reset this tie breaker? All qualified players and tie-breaker progress will be cleared.', async () => {
+      isProcessing = true;
+      try {
+        const { data, error } = await supabase.rpc('reset_tiebreaker', {
+          p_game_id: selectedGameId
+        });
+        if (error) throw error;
+        if (data?.success) {
+          tieBreakerParticipants = [];
+          tieBreakerTimeRemaining = 0;
+          if (tieBreakerTimer) {
+            clearInterval(tieBreakerTimer);
+            tieBreakerTimer = null;
+          }
+          await refreshSelectedGame();
+        }
+      } catch (e) {
+        console.error('Reset tie-breaker failed:', e);
+      } finally {
+        isProcessing = false;
+      }
+    });
   }
 
   function startTieBreakerTimer() {
@@ -888,7 +973,7 @@
   }
 
   function kickTieBreakerPlayer(playerId, playerName) {
-    showConfirm(`Remove ${playerName} from the tie breaker lobby?`, async () => {
+    showConfirm(`Remove ${playerName} from this lobby?`, async () => {
       isProcessing = true;
       try {
         const { data, error } = await supabase.rpc('kick_tiebreaker_player', {
@@ -1125,118 +1210,46 @@
       {/if}
 
       <!-- ========== DEDICATED LOBBY VIEW ========== -->
-      {#if inLobby && selectedGame}
+      {#if isTieBreakerMode}
         <div class="animate-fade-in">
-          <!-- Lobby Header -->
-          <div class="text-center mb-6">
-            <div class="inline-block px-6 py-2 rounded-full bg-green-50 border border-green-200 mb-3">
-              <span class="text-lg font-bold text-green-700 tracking-[0.3em]">
-                GAME {selectedGame.game_number} LOBBY OPEN
-              </span>
-            </div>
-          </div>
-
-          <div class="grid grid-cols-12 gap-6">
-            <!-- Left: QR + Join URL + Count -->
-            <div class="col-span-5 flex flex-col items-center gap-6">
-              <div class="bg-white rounded-3xl flex items-center justify-center p-4 border border-gray-200 shadow-lg" style="width: min(380px, 70vw); height: min(380px, 70vw);">
-                {#if qrDataUrl}
-                  <img src={qrDataUrl} alt="Join QR Code" class="w-full h-full object-contain" />
-                {:else}
-                  <div class="w-12 h-12 border-4 border-gray-200 border-t-purple-500 rounded-full animate-spin"></div>
-                {/if}
-              </div>
-
-              <div class="text-center space-y-1">
-                <p class="text-sm text-gray-500 uppercase tracking-wider font-semibold">Scan to Join</p>
-                {#if joinUrl}
-                  <p class="text-sm text-purple-600 font-mono">{joinUrl}</p>
-                {/if}
-              </div>
-
-              <div class="text-center">
-                <div class="text-5xl font-black text-gray-900">
-                  <span class="text-purple-600">{activePlayerCount}</span>
-                  <span class="text-gray-300 text-3xl"> / {selectedGame.max_players}</span>
-                </div>
-                <p class="text-sm text-gray-400 mt-1 uppercase tracking-wider">Players Joined</p>
-              </div>
-
-              {#if activePlayerCount >= selectedGame.max_players}
-                <div class="px-6 py-2 rounded-xl bg-green-50 border border-green-200">
-                  <p class="text-sm font-bold text-green-700">LOBBY FULL</p>
-                </div>
-              {/if}
-            </div>
-
-            <!-- Right: Player List -->
-            <div class="col-span-7">
-              <div class="glass-strong rounded-2xl p-5 h-full">
-                <h3 class="text-sm font-semibold text-gray-500 uppercase tracking-wider mb-4 flex items-center gap-2">
-                  <Users size={16} />
-                  Joined Players — {activePlayerCount} / {selectedGame.max_players}
-                </h3>
-
-                <div class="grid grid-cols-2 gap-x-6 gap-y-1 max-h-[calc(100vh-350px)] overflow-y-auto pr-2">
-                  {#each activePlayers as player, i (player.id)}
-                    <div class="flex items-center gap-3 py-2 px-3 rounded-lg hover:bg-gray-50 transition-colors group">
-                      <span class="text-xs text-gray-400 font-mono w-6 text-right">{String(i + 1).padStart(2, '0')}</span>
-                      <span class="text-gray-900 font-medium flex-1 truncate">{player.name}</span>
-                      {#if selectedGame.status === 'LOBBY_OPEN'}
-                        <button
-                          onclick={() => removePlayer(player.id)}
-                          class="p-1 rounded-lg opacity-0 group-hover:opacity-100 hover:bg-red-50 text-gray-300 hover:text-red-500 transition-all"
-                          title="Remove player"
-                        >
-                          <Trash2 size={12} />
-                        </button>
-                      {/if}
-                    </div>
-                  {:else}
-                    <div class="col-span-2 py-12 text-center text-gray-400">
-                      <Users size={32} class="mx-auto mb-3 opacity-30" />
-                      <p>Waiting for players to join...</p>
-                    </div>
-                  {/each}
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <!-- Lobby Action Buttons -->
-          <div class="flex gap-4 mt-6 justify-center">
+          <div class="mb-4">
             <button
-              onclick={closeLobby}
-              disabled={isProcessing}
-              class="flex items-center justify-center gap-2 px-8 py-3.5 rounded-xl border-2 border-orange-300 bg-white hover:bg-orange-50 hover:border-orange-400 disabled:bg-gray-100 disabled:border-gray-200 disabled:text-gray-400 text-orange-600 font-semibold transition-all active:scale-[0.98]"
+              onclick={() => { dashboardMode = 'game'; }}
+              class="flex items-center gap-2 px-4 py-2 rounded-xl bg-white border border-gray-200 text-gray-600 hover:text-gray-900 hover:bg-gray-50 transition-all text-sm"
             >
-              <Lock size={18} />
-              CLOSE LOBBY
-            </button>
-
-            <button
-              onclick={startGame}
-              disabled={isProcessing || activePlayerCount === 0}
-              class="flex items-center justify-center gap-2 px-12 py-3.5 rounded-xl bg-purple-600 hover:bg-purple-700 disabled:bg-gray-200 disabled:text-gray-400 text-white font-bold text-lg transition-all active:scale-[0.98] shadow-lg shadow-purple-600/25"
-            >
-              <Play size={20} />
-              START GAME
+              <ChevronRight size={16} class="rotate-180" />
+              BACK TO GAMES
             </button>
           </div>
-        </div>
-
-      <!-- ========== TIE BREAKER LOBBY VIEW ========== -->
-      {:else if (isTieBreakerLobby || isTieBreakerActive || isTieBreakerCompleted || isTieBreakerUnresolved) && selectedGame}
-        <div class="animate-fade-in">
-          {#if isTieBreakerLobby}
-            <!-- Tie Breaker Lobby -->
+          <!-- ========== TIE BREAKER OVERVIEW / NOT REQUIRED ========== -->
+          {#if !selectedGame || !(isTieBreakerLobby || isTieBreakerCountdown || isTieBreakerActive || isTieBreakerCompleted || isTieBreakerUnresolved)}
             <div class="text-center mb-6">
-              <div class="inline-block px-6 py-2 rounded-full bg-amber-50 border border-amber-200 mb-3">
-                <span class="text-lg font-bold text-amber-700 tracking-[0.3em]">
-                  TIE BREAKER LOBBY
+              <div class="inline-block px-6 py-2 rounded-full bg-gray-100 border border-gray-200 mb-3">
+                <span class="text-lg font-bold text-gray-500 tracking-[0.3em]">
+                  TIE BREAKER NOT REQUIRED
                 </span>
               </div>
             </div>
+
+            <div class="glass-strong rounded-2xl p-8 text-center max-w-lg mx-auto space-y-4">
+              <div class="text-5xl mb-2">&#x1F3C6;</div>
+              <h2 class="text-2xl font-bold text-gray-900">No Tie-Breaker Round Yet</h2>
+              <p class="text-gray-500">
+                A tie breaker is only needed when two or more players finish a game with the same top score.
+                Complete a game to check for a tie.
+              </p>
+            </div>
+          {:else}
+            <!-- ========== TIE BREAKER VIEW ========== -->
+            {#if isTieBreakerLobby}
+              <!-- Tie Breaker Lobby -->
+              <div class="text-center mb-6">
+                <div class="inline-block px-6 py-2 rounded-full bg-amber-50 border border-amber-200 mb-3">
+                  <span class="text-lg font-bold text-amber-700 tracking-[0.3em]">
+                    TIE BREAKER LOBBY
+                  </span>
+                </div>
+              </div>
 
             <div class="grid grid-cols-12 gap-6">
               <div class="col-span-5 flex flex-col items-center gap-6">
@@ -1276,10 +1289,11 @@
                         {#if !participant.is_kicked}
                           <button
                             onclick={() => kickTieBreakerPlayer(participant.player_id, participant.name)}
-                            class="p-1.5 rounded-lg opacity-0 group-hover:opacity-100 hover:bg-red-50 text-gray-300 hover:text-red-500 transition-all"
+                            class="flex items-center gap-1 px-2.5 py-1 rounded-lg bg-red-50 border border-red-200 text-red-600 hover:bg-red-100 text-xs font-semibold transition-all"
                             title="Remove from tie-breaker"
                           >
-                            <Trash2 size={14} />
+                            <Trash2 size={12} />
+                            KICK OUT
                           </button>
                         {/if}
                       </div>
@@ -1298,10 +1312,19 @@
               <button
                 onclick={cancelTieBreaker}
                 disabled={isProcessing}
-                class="flex items-center justify-center gap-2 px-8 py-3.5 rounded-xl border-2 border-red-300 bg-white hover:bg-red-50 hover:border-red-400 disabled:bg-gray-100 disabled:border-gray-200 disabled:text-gray-400 text-red-600 font-semibold transition-all active:scale-[0.98]"
+                class="flex items-center justify-center gap-2 px-8 py-3.5 rounded-xl border-2 border-orange-300 bg-white hover:bg-orange-50 hover:border-orange-400 disabled:bg-gray-100 disabled:border-gray-200 disabled:text-gray-400 text-orange-600 font-semibold transition-all active:scale-[0.98]"
               >
                 <X size={18} />
-                CANCEL TIE BREAKER
+                CLOSE TIE BREAKER LOBBY
+              </button>
+
+              <button
+                onclick={resetTieBreaker}
+                disabled={isProcessing}
+                class="flex items-center justify-center gap-2 px-8 py-3.5 rounded-xl border-2 border-gray-300 bg-white hover:bg-red-50 hover:border-red-400 disabled:bg-gray-100 disabled:border-gray-200 disabled:text-gray-400 text-gray-600 hover:text-red-600 font-semibold transition-all active:scale-[0.98]"
+              >
+                <RefreshCcw size={18} />
+                RESET TIE BREAKER
               </button>
 
               <button
@@ -1319,6 +1342,48 @@
                 Need at least 2 eligible players to start. {eligibleTBPlayers.length} currently eligible.
               </p>
             {/if}
+
+          {:else if isTieBreakerCountdown}
+            <!-- Tie Breaker Countdown -->
+            {#if tieBreakerCountdown !== null}
+              <div class="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm">
+                <div class="text-center animate-scale-in">
+                  <div class="text-9xl font-black text-orange-500 animate-countdown select-none">
+                    {tieBreakerCountdown}
+                  </div>
+                  <p class="text-gray-300 text-xl mt-4">Tie Breaker Starting...</p>
+                </div>
+              </div>
+            {/if}
+
+            <div class="text-center mb-6">
+              <div class="inline-block px-6 py-2 rounded-full bg-orange-50 border border-orange-200 mb-3">
+                <span class="text-lg font-bold text-orange-700 tracking-[0.3em]">
+                  TIE BREAKER COUNTDOWN
+                </span>
+              </div>
+            </div>
+
+            <div class="glass-strong rounded-2xl p-8 text-center max-w-lg mx-auto space-y-4">
+              <div class="text-5xl mb-2">&#x23F3;</div>
+              <h2 class="text-2xl font-bold text-gray-900">Tie Breaker Starting...</h2>
+              <p class="text-gray-500">Qualified players get ready on their screens!</p>
+              <div class="flex flex-wrap justify-center gap-2 pt-2">
+                {#each eligibleTBPlayers as player, i (player.player_id)}
+                  <span class="px-3 py-1.5 rounded-xl bg-amber-50 border border-amber-200 text-amber-700 font-medium text-sm">
+                    {i + 1}. {player.name}
+                  </span>
+                {/each}
+              </div>
+              <button
+                onclick={cancelTieBreaker}
+                disabled={isProcessing}
+                class="mt-2 flex items-center justify-center gap-2 px-8 py-3 rounded-xl border-2 border-red-300 bg-white hover:bg-red-50 hover:border-red-400 disabled:bg-gray-100 disabled:border-gray-200 disabled:text-gray-400 text-red-600 font-semibold transition-all active:scale-[0.98]"
+              >
+                <X size={18} />
+                CLOSE TIE BREAKER
+              </button>
+            </div>
 
           {:else if isTieBreakerActive}
             <!-- Tie Breaker Active -->
@@ -1416,6 +1481,17 @@
               </div>
             </div>
 
+            <div class="flex gap-4 mt-6 justify-center">
+              <button
+                onclick={resetTieBreaker}
+                disabled={isProcessing}
+                class="flex items-center justify-center gap-2 px-8 py-3 rounded-xl border-2 border-gray-300 bg-white hover:bg-red-50 hover:border-red-400 disabled:bg-gray-100 disabled:border-gray-200 disabled:text-gray-400 text-gray-600 hover:text-red-600 font-semibold transition-all active:scale-[0.98]"
+              >
+                <RefreshCcw size={16} />
+                RESET TIE BREAKER
+              </button>
+            </div>
+
           {:else if isTieBreakerCompleted}
             <!-- Tie Breaker Completed -->
             <div class="text-center mb-6">
@@ -1440,6 +1516,17 @@
               {/if}
             </div>
 
+            <div class="flex gap-4 mt-6 justify-center">
+              <button
+                onclick={resetTieBreaker}
+                disabled={isProcessing}
+                class="flex items-center justify-center gap-2 px-8 py-3 rounded-xl border-2 border-gray-300 bg-white hover:bg-red-50 hover:border-red-400 disabled:bg-gray-100 disabled:border-gray-200 disabled:text-gray-400 text-gray-600 hover:text-red-600 font-semibold transition-all active:scale-[0.98]"
+              >
+                <RefreshCcw size={16} />
+                RESET TIE BREAKER
+              </button>
+            </div>
+
           {:else if isTieBreakerUnresolved}
             <div class="text-center mb-6">
               <div class="inline-block px-6 py-2 rounded-full bg-gray-100 border border-gray-200 mb-3">
@@ -1455,14 +1542,128 @@
               <p class="text-gray-500">No winner was determined from the tie-breaker round.</p>
               <p class="text-sm text-gray-400">Top players with equal scores share the top position.</p>
             </div>
+
+            <div class="flex gap-4 mt-6 justify-center">
+              <button
+                onclick={resetTieBreaker}
+                disabled={isProcessing}
+                class="flex items-center justify-center gap-2 px-8 py-3 rounded-xl border-2 border-gray-300 bg-white hover:bg-red-50 hover:border-red-400 disabled:bg-gray-100 disabled:border-gray-200 disabled:text-gray-400 text-gray-600 hover:text-red-600 font-semibold transition-all active:scale-[0.98]"
+              >
+                <RefreshCcw size={16} />
+                RESET TIE BREAKER
+              </button>
+            </div>
           {/if}
+        {/if}
+        </div>
+
+      <!-- ========== DEDICATED LOBBY VIEW ========== -->
+      {:else if inLobby && selectedGame}
+        <div class="animate-fade-in">
+          <!-- Lobby Header -->
+          <div class="text-center mb-6">
+            <div class="inline-block px-6 py-2 rounded-full bg-green-50 border border-green-200 mb-3">
+              <span class="text-lg font-bold text-green-700 tracking-[0.3em]">
+                GAME {selectedGame.game_number} LOBBY OPEN
+              </span>
+            </div>
+          </div>
+
+          <div class="grid grid-cols-12 gap-6">
+            <!-- Left: QR + Join URL + Count -->
+            <div class="col-span-5 flex flex-col items-center gap-6">
+              <div class="bg-white rounded-3xl flex items-center justify-center p-4 border border-gray-200 shadow-lg" style="width: min(380px, 70vw); height: min(380px, 70vw);">
+                {#if qrDataUrl}
+                  <img src={qrDataUrl} alt="Join QR Code" class="w-full h-full object-contain" />
+                {:else}
+                  <div class="w-12 h-12 border-4 border-gray-200 border-t-purple-500 rounded-full animate-spin"></div>
+                {/if}
+              </div>
+
+              <div class="text-center space-y-1">
+                <p class="text-sm text-gray-500 uppercase tracking-wider font-semibold">Scan to Join</p>
+                {#if joinUrl}
+                  <p class="text-sm text-purple-600 font-mono">{joinUrl}</p>
+                {/if}
+              </div>
+
+              <div class="text-center">
+                <div class="text-5xl font-black text-gray-900">
+                  <span class="text-purple-600">{activePlayerCount}</span>
+                  <span class="text-gray-300 text-3xl"> / {selectedGame.max_players}</span>
+                </div>
+                <p class="text-sm text-gray-400 mt-1 uppercase tracking-wider">Players Joined</p>
+              </div>
+
+              {#if activePlayerCount >= selectedGame.max_players}
+                <div class="px-6 py-2 rounded-xl bg-green-50 border border-green-200">
+                  <p class="text-sm font-bold text-green-700">LOBBY FULL</p>
+                </div>
+              {/if}
+            </div>
+
+            <!-- Right: Player List -->
+            <div class="col-span-7">
+              <div class="glass-strong rounded-2xl p-5 h-full">
+                <h3 class="text-sm font-semibold text-gray-500 uppercase tracking-wider mb-4 flex items-center gap-2">
+                  <Users size={16} />
+                  Joined Players — {activePlayerCount} / {selectedGame.max_players}
+                </h3>
+
+                <div class="grid grid-cols-2 gap-x-6 gap-y-1 max-h-[calc(100vh-350px)] overflow-y-auto pr-2">
+                  {#each activePlayers as player, i (player.id)}
+                    <div class="flex items-center gap-3 py-2 px-3 rounded-lg hover:bg-gray-50 transition-colors group">
+                      <span class="text-xs text-gray-400 font-mono w-6 text-right">{String(i + 1).padStart(2, '0')}</span>
+                      <span class="text-gray-900 font-medium flex-1 truncate">{player.name}</span>
+                      {#if selectedGame.status === 'LOBBY_OPEN'}
+                        <button
+                          onclick={() => removePlayer(player.id, player.name)}
+                          class="flex items-center gap-1 px-2 py-0.5 rounded-lg bg-red-50 border border-red-200 text-red-600 hover:bg-red-100 text-xs font-semibold transition-all"
+                          title="Remove player"
+                        >
+                          <Trash2 size={12} />
+                          KICK OUT
+                        </button>
+                      {/if}
+                    </div>
+                  {:else}
+                    <div class="col-span-2 py-12 text-center text-gray-400">
+                      <Users size={32} class="mx-auto mb-3 opacity-30" />
+                      <p>Waiting for players to join...</p>
+                    </div>
+                  {/each}
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Lobby Action Buttons -->
+          <div class="flex gap-4 mt-6 justify-center">
+            <button
+              onclick={closeLobby}
+              disabled={isProcessing}
+              class="flex items-center justify-center gap-2 px-8 py-3.5 rounded-xl border-2 border-orange-300 bg-white hover:bg-orange-50 hover:border-orange-400 disabled:bg-gray-100 disabled:border-gray-200 disabled:text-gray-400 text-orange-600 font-semibold transition-all active:scale-[0.98]"
+            >
+              <Lock size={18} />
+              CLOSE LOBBY
+            </button>
+
+            <button
+              onclick={startGame}
+              disabled={isProcessing || activePlayerCount === 0}
+              class="flex items-center justify-center gap-2 px-12 py-3.5 rounded-xl bg-purple-600 hover:bg-purple-700 disabled:bg-gray-200 disabled:text-gray-400 text-white font-bold text-lg transition-all active:scale-[0.98] shadow-lg shadow-purple-600/25"
+            >
+              <Play size={20} />
+              START GAME
+            </button>
+          </div>
         </div>
 
       <!-- ========== NORMAL DASHBOARD VIEW ========== -->
       {:else}
 
         <!-- Game Selector -->
-        <div class="grid grid-cols-3 gap-4 animate-slide-up">
+        <div class="grid grid-cols-4 gap-4 animate-slide-up">
           {#each games as game (game.id)}
             <button
               onclick={() => selectGame(game.id)}
@@ -1493,6 +1694,29 @@
               </div>
             </button>
           {/each}
+
+          <button
+            onclick={selectTieBreaker}
+            class="glass-strong rounded-2xl p-5 text-left transition-all hover:shadow-md {isTieBreakerMode ? 'ring-2 ring-amber-500 border-amber-300 shadow-lg' : ''}"
+          >
+            <div class="flex items-center justify-between mb-3">
+              <span class="text-lg font-bold text-gray-900">Tie Breaker</span>
+              <span class="px-2.5 py-1 rounded-full text-xs font-semibold {getTieBreakerColor(getTieBreakerStatusFor(selectedGame))}">
+                {getTieBreakerStatusFor(selectedGame)}
+              </span>
+            </div>
+
+            <div class="space-y-2">
+              <div class="flex items-center gap-2 text-sm text-gray-500">
+                <Users size={14} />
+                <span>{(selectedGame?.tie_breaker_participants || []).filter(p => !p.is_kicked).length} Qualified</span>
+              </div>
+              <div class="flex items-center gap-2 text-sm text-amber-600">
+                <Trophy size={14} />
+                <span>Tie-Breaker Round</span>
+              </div>
+            </div>
+          </button>
         </div>
 
         {#if selectedGame}
@@ -1898,13 +2122,13 @@
           onclick={cancelConfirm}
           class="flex-1 py-2.5 rounded-xl bg-gray-100 border border-gray-200 text-gray-600 hover:bg-gray-200 font-medium transition-all"
         >
-          Cancel
+          CANCEL
         </button>
         <button
           onclick={handleConfirm}
           class="flex-1 py-2.5 rounded-xl bg-red-600 hover:bg-red-500 text-white font-semibold transition-all"
         >
-          Confirm
+          {confirmMessage.startsWith('Remove') ? 'REMOVE PLAYER' : 'CONFIRM'}
         </button>
       </div>
     </div>
